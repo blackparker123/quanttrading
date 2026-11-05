@@ -342,11 +342,13 @@ def update_paper_positions(results: list[dict], signal_mode: str) -> None:
 
     for result in results:
         symbol = result["Symbol"]
+        history = add_indicators(download_history(symbol))
+        latest_date = pd.Timestamp(history.index[-1])
         position = positions.get(symbol)
         if position is None and result["Action"] == "BUY" and result["RSI Cross Up 50"]:
             position = {
                 "status": "pending",
-                "signal_date": pd.Timestamp(result["Date"]),
+                "signal_date": latest_date,
                 "entry_atr": float(result["ATR (14)"]),
                 "mode": signal_mode,
             }
@@ -357,7 +359,6 @@ def update_paper_positions(results: list[dict], signal_mode: str) -> None:
             result["Paper entry"] = None
             continue
 
-        history = add_indicators(download_history(symbol))
         signal_date = position["signal_date"]
         bars = history.loc[history.index > signal_date]
         if position["status"] == "active" and position.get("last_processed_date") is not None:
@@ -431,7 +432,6 @@ def update_paper_positions(results: list[dict], signal_mode: str) -> None:
             result["Paper entry"] = None
             continue
 
-        latest_date = pd.Timestamp(history.index[-1])
         if (
             position["status"] == "active"
             and position["mode"] == signal_mode
