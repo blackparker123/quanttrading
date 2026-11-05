@@ -1,0 +1,462 @@
+"""QuantTrading: a data-driven, research-only Nifty 50 swing scanner."""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+from plotly.subplots import make_subplots
+
+
+# Edit this list to scan other Yahoo Finance symbols. NSE symbols end in .NS.
+WATCHLIST = {
+    "HDFCBANK.NS": "HDFC Bank",
+    "ICICIBANK.NS": "ICICI Bank",
+    "RELIANCE.NS": "Reliance Industries",
+    "BHARTIARTL.NS": "Bharti Airtel",
+    "LT.NS": "Larsen & Toubro",
+    "INFY.NS": "Infosys",
+    "SBIN.NS": "State Bank of India",
+    "AXISBANK.NS": "Axis Bank",
+    "KOTAKBANK.NS": "Kotak Mahindra Bank",
+    "ITC.NS": "ITC",
+}
+
+HISTORY_PERIOD = "2y"  # Gives enough daily candles for the 200-day average.
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+VOLUME_AVERAGE_PERIOD = 20
+ATR_STOP_MULTIPLE = 2.0
+REWARD_RISK_RATIO = 2.0
+BUY_VOLUME_MULTIPLE = 1.2
+ADX_MINIMUM = 20.0
+CMF_PERIOD = 20
+BACKTEST_DAYS = 252
+
+st.set_page_config(page_title="QuantTrading | Nifty 50 Research", page_icon="📈", layout="wide")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def download_history(symbol: str) -> pd.DataFrame:
+    """Fetch adjusted daily OHLCV. Raise a readable error for empty/bad responses."""
+    data = yf.download(
+        symbol,
+        period=HISTORY_PERIOD,
+        interval="1d",
+        auto_adjust=True,
+        multi_level_index=False,
+        progress=False,
+        threads=False,
+        timeout=20,
+    )
+    if data is None or data.empty:
+        raise ValueError("No daily data returned. The symbol may be unavailable or Yahoo may be limiting requests.")
+
+    # Be tolerant of yfinance versions that return two-level column names.
+    if isinstance(data.columns, pd.MultiIndex):
+        fields = {"open", "high", "low", "close", "volume"}
+        flattened = []
+        for column in data.columns:
+            match = next((str(part).strip().lower() for part in column if str(part).strip().lower() in fields), None)
+            flattened.append(match.title() if match else str(column[-1]))
+        data.columns = flattened
+    else:
+        data.columns = [str(column).strip().title() for column in data.columns]
+
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    missing = [name for name in required if name not in data.columns]
+    if missing:
+        raise ValueError(f"Price data is missing fields: {', '.join(missing)}")
+
+    data = data[required].copy()
+    data = data[~data.index.duplicated(keep="last")].sort_index()
+    for column in required:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    return data.dropna(subset=["Close"])
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def download_pe(symbol: str) -> float | None:
+    """Return Yahoo's trailing P/E when available; valuation data can be missing."""
+    try:
+        value = yf.Ticker(symbol).info.get("trailingPE")
+        return float(value) if value is not None and pd.notna(value) else None
+    except Exception:
+        return None
+
+
+def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
+    """Add trend, momentum, volume, and volatility measures to a price frame."""
+    result = data.copy()
+    close = result["Close"]
+
+    for period in (20, 50, 200):
+        result[f"SMA{period}"] = close.rolling(period, min_periods=period).mean()
+
+    change = close.diff()
+    average_gain = change.clip(lower=0).ewm(alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False).mean()
+    average_loss = (-change.clip(upper=0)).ewm(alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False).mean()
+    relative_strength = average_gain / average_loss.replace(0, float("nan"))
+    result["RSI"] = 100 - (100 / (1 + relative_strength))
+    result.loc[(average_loss == 0) & (average_gain > 0), "RSI"] = 100
+    result.loc[(average_loss == 0) & (average_gain == 0), "RSI"] = 50
+
+    ema12 = close.ewm(span=12, min_periods=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, min_periods=26, adjust=False).mean()
+    result["MACD"] = ema12 - ema26
+    result["MACD Signal"] = result["MACD"].ewm(span=9, min_periods=9, adjust=False).mean()
+
+    previous_close = close.shift(1)
+    true_range = pd.concat(
+        [result["High"] - result["Low"], (result["High"] - previous_close).abs(), (result["Low"] - previous_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    result["ATR"] = true_range.ewm(alpha=1 / ATR_PERIOD, min_periods=ATR_PERIOD, adjust=False).mean()
+    result["Volume Avg"] = result["Volume"].rolling(VOLUME_AVERAGE_PERIOD, min_periods=VOLUME_AVERAGE_PERIOD).mean()
+
+    # Bollinger Bands: 20-day mean plus/minus two rolling standard deviations.
+    rolling_std = close.rolling(20, min_periods=20).std(ddof=0)
+    result["BB Upper"] = result["SMA20"] + 2 * rolling_std
+    result["BB Lower"] = result["SMA20"] - 2 * rolling_std
+    band_width = (result["BB Upper"] - result["BB Lower"]).replace(0, float("nan"))
+    result["BB %B"] = (close - result["BB Lower"]) / band_width
+
+    # ADX (14): Wilder-smoothed directional movement divided by true range.
+    up_move = result["High"].diff()
+    down_move = -result["Low"].diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    atr_smooth = true_range.ewm(alpha=1 / ATR_PERIOD, min_periods=ATR_PERIOD, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / ATR_PERIOD, min_periods=ATR_PERIOD, adjust=False).mean() / atr_smooth
+    minus_di = 100 * minus_dm.ewm(alpha=1 / ATR_PERIOD, min_periods=ATR_PERIOD, adjust=False).mean() / atr_smooth
+    di_sum = (plus_di + minus_di).replace(0, float("nan"))
+    dx = 100 * (plus_di - minus_di).abs() / di_sum
+    result["ADX"] = dx.ewm(alpha=1 / ATR_PERIOD, min_periods=ATR_PERIOD, adjust=False).mean()
+
+    # CMF (20): positive values mean more volume traded near daily highs.
+    day_range = (result["High"] - result["Low"]).replace(0, float("nan"))
+    money_flow_multiplier = ((close - result["Low"]) - (result["High"] - close)) / day_range
+    money_flow_volume = money_flow_multiplier.fillna(0) * result["Volume"]
+    result["CMF"] = money_flow_volume.rolling(CMF_PERIOD, min_periods=CMF_PERIOD).sum() / result["Volume"].rolling(CMF_PERIOD, min_periods=CMF_PERIOD).sum().replace(0, float("nan"))
+
+    # One-year buy-and-hold history statistics, shown as context rather than strategy results.
+    daily_returns = close.pct_change().dropna().tail(BACKTEST_DAYS)
+    result["Sharpe 1Y"] = float("nan")
+    result["Max DD 1Y %"] = float("nan")
+    if len(daily_returns) > 1 and daily_returns.std(ddof=1) > 0:
+        result.loc[result.index[-1], "Sharpe 1Y"] = (daily_returns.mean() / daily_returns.std(ddof=1)) * (252 ** 0.5)
+        equity = (1 + daily_returns).cumprod()
+        drawdown = equity / equity.cummax() - 1
+        result.loc[result.index[-1], "Max DD 1Y %"] = drawdown.min() * 100
+    return result
+
+
+def evaluate(symbol: str, company: str, max_pe: float, min_sharpe: float, max_drawdown_pct: float) -> dict:
+    """Apply fixed, visible rules and calculate illustrative ATR-based levels."""
+    history = add_indicators(download_history(symbol))
+    last = history.iloc[-1]
+    fields = ["Close", "SMA20", "SMA50", "SMA200", "RSI", "MACD", "MACD Signal", "ATR", "Volume", "Volume Avg", "ADX", "CMF", "BB Upper"]
+    if any(pd.isna(last[field]) for field in fields) or last["ATR"] <= 0:
+        raise ValueError("Not enough clean daily history to calculate all indicators and risk levels.")
+
+    price = float(last["Close"])
+    sma20, sma50, sma200 = (float(last[name]) for name in ("SMA20", "SMA50", "SMA200"))
+    rsi = float(last["RSI"])
+    macd, macd_signal = float(last["MACD"]), float(last["MACD Signal"])
+    atr = float(last["ATR"])
+    volume_ratio = float(last["Volume"] / last["Volume Avg"]) if last["Volume Avg"] else 0.0
+    adx = float(last["ADX"])
+    cmf = float(last["CMF"])
+    bb_percent_b = float(last["BB %B"]) if pd.notna(last["BB %B"]) else float("nan")
+    sharpe_1y = float(last["Sharpe 1Y"]) if pd.notna(last["Sharpe 1Y"]) else None
+    max_dd_1y_pct = float(last["Max DD 1Y %"]) if pd.notna(last["Max DD 1Y %"]) else None
+    pe = download_pe(symbol)
+
+    pe_ok = max_pe <= 0 or pe is None or (0 < pe <= max_pe)
+    sharpe_ok = sharpe_1y is None or sharpe_1y >= min_sharpe
+    drawdown_ok = max_dd_1y_pct is None or max_dd_1y_pct >= -max_drawdown_pct
+
+    buy_checks = {
+        "Price above 20-day average": price > sma20,
+        "20-day average above 50-day": sma20 > sma50,
+        "50-day average above 200-day": sma50 > sma200,
+        "MACD above signal": macd > macd_signal,
+        "RSI between 50 and 70": 50 <= rsi <= 70,
+        f"Volume at least {BUY_VOLUME_MULTIPLE:.1f}× its 20-day average": volume_ratio >= BUY_VOLUME_MULTIPLE,
+        f"ADX confirms trend (≥ {ADX_MINIMUM:.0f})": adx >= ADX_MINIMUM,
+        "CMF confirms positive volume flow": cmf > 0,
+        "Close is not above the upper Bollinger Band": price <= float(last["BB Upper"]),
+        f"1Y Sharpe meets minimum ({min_sharpe:.1f})": sharpe_ok,
+        f"1Y max drawdown is within {max_drawdown_pct:.0f}%": drawdown_ok,
+        f"Trailing P/E is positive and ≤ {max_pe:.0f}, when available": pe_ok,
+    }
+    watch_ok = price > sma50 > sma200 and macd > macd_signal and 40 <= rsi <= 75 and cmf > -0.05
+    if all(buy_checks.values()):
+        action = "BUY"
+        reason = "Trend, momentum, volatility, volume-flow, valuation, and historical-risk filters all pass."
+        stop = price - ATR_STOP_MULTIPLE * atr
+        target = price + REWARD_RISK_RATIO * (price - stop)
+    elif watch_ok:
+        action = "HOLD"
+        failed = [name for name, passed in buy_checks.items() if not passed]
+        reason = "Long-term trend and momentum pass; BUY filters still missing: " + "; ".join(failed) + "."
+        stop = target = None
+    else:
+        action = "SELL" if price < sma50 and macd < macd_signal and adx >= ADX_MINIMUM and cmf < 0 else "NO ACTION"
+        failed = []
+        if price <= sma50:
+            failed.append("price is not above the 50-day average")
+        if sma50 <= sma200:
+            failed.append("50-day average is not above the 200-day average")
+        if macd <= macd_signal:
+            failed.append("MACD is not above its signal")
+        if adx < ADX_MINIMUM:
+            failed.append(f"ADX ({adx:.1f}) is below the trend threshold")
+        if cmf >= 0:
+            failed.append("CMF does not show negative volume flow")
+        if not 40 <= rsi <= 75:
+            failed.append(f"RSI ({rsi:.1f}) is outside the 40–75 watch range")
+        reason = "; ".join(failed) or "The BUY and WATCH rules are not met."
+        stop = target = None
+
+    # Always show a comparable ATR scenario. SELL uses a hypothetical short;
+    # BUY, HOLD, and NO ACTION use an illustrative long scenario.
+    scenario = "Short" if action == "SELL" else "Long"
+    if stop is None:
+        if scenario == "Short":
+            stop = price + ATR_STOP_MULTIPLE * atr
+            target = price - REWARD_RISK_RATIO * (stop - price)
+        else:
+            stop = price - ATR_STOP_MULTIPLE * atr
+            target = price + REWARD_RISK_RATIO * (price - stop)
+
+    risk_pct = (abs(price - stop) / price * 100) if stop is not None else None
+    reward_pct = (abs(target - price) / price * 100) if target is not None else None
+    date = pd.Timestamp(history.index[-1]).strftime("%d %b %Y")
+    return {
+        "Symbol": symbol, "Company": company, "Date": date, "Action": action, "Scenario": scenario, "Reason": reason,
+        "Price": price, "Stop loss": stop, "Target": target, "Risk %": risk_pct,
+        "Reward %": reward_pct, "RSI (14)": rsi, "Trend": "Bullish" if price > sma50 > sma200 else "Mixed / weak",
+        "Volume vs avg": volume_ratio, "SMA20": sma20, "SMA50": sma50, "SMA200": sma200,
+        "MACD": macd, "MACD Signal": macd_signal, "ATR (14)": atr, "ADX (14)": adx,
+        "CMF (20)": cmf, "BB %B": bb_percent_b, "P/E": pe,
+        "Sharpe 1Y": sharpe_1y, "Max DD 1Y %": max_dd_1y_pct,
+        "Reward/Risk": (abs(target - price) / abs(price - stop)) if stop is not None and price != stop else None,
+    }
+
+
+def money(value):
+    return "—" if value is None or pd.isna(value) else f"₹{value:,.2f}"
+
+
+def make_candlestick_chart(data: pd.DataFrame, show_sma20: bool, show_sma50: bool, show_sma200: bool, show_bollinger: bool):
+    """Create a readable daily candlestick chart with optional overlays and volume."""
+    figure = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.035,
+        row_heights=[0.76, 0.24],
+    )
+    dates = data.index
+    figure.add_trace(
+        go.Candlestick(
+            x=dates,
+            open=data["Open"],
+            high=data["High"],
+            low=data["Low"],
+            close=data["Close"],
+            name="Daily candles",
+            increasing_line_color="#16a34a",
+            decreasing_line_color="#dc2626",
+            increasing_fillcolor="#16a34a",
+            decreasing_fillcolor="#dc2626",
+            showlegend=True,
+        ),
+        row=1,
+        col=1,
+    )
+
+    overlays = [
+        (show_sma20, "SMA20", "#2563eb", "solid"),
+        (show_sma50, "SMA50", "#f59e0b", "solid"),
+        (show_sma200, "SMA200", "#7c3aed", "dash"),
+    ]
+    for enabled, column, color, dash in overlays:
+        if enabled:
+            figure.add_trace(
+                go.Scatter(x=dates, y=data[column], name=column, mode="lines", line={"color": color, "width": 1.5, "dash": dash}),
+                row=1,
+                col=1,
+            )
+    if show_bollinger:
+        figure.add_trace(
+            go.Scatter(x=dates, y=data["BB Upper"], name="Bollinger upper", mode="lines", line={"color": "#64748b", "width": 1, "dash": "dot"}),
+            row=1,
+            col=1,
+        )
+        figure.add_trace(
+            go.Scatter(x=dates, y=data["BB Lower"], name="Bollinger lower", mode="lines", line={"color": "#64748b", "width": 1, "dash": "dot"}),
+            row=1,
+            col=1,
+        )
+
+    volume_colors = ["#16a34a" if close >= open_ else "#dc2626" for open_, close in zip(data["Open"], data["Close"])]
+    figure.add_trace(
+        go.Bar(x=dates, y=data["Volume"], name="Volume", marker_color=volume_colors, opacity=0.7),
+        row=2,
+        col=1,
+    )
+    figure.update_layout(
+        height=650,
+        margin={"l": 8, "r": 8, "t": 36, "b": 8},
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        xaxis={"rangeselector": {"buttons": [
+            {"count": 1, "label": "1m", "step": "month", "stepmode": "backward"},
+            {"count": 3, "label": "3m", "step": "month", "stepmode": "backward"},
+            {"count": 6, "label": "6m", "step": "month", "stepmode": "backward"},
+            {"count": 1, "label": "1y", "step": "year", "stepmode": "backward"},
+            {"step": "all", "label": "2y"},
+        ]}},
+    )
+    figure.update_yaxes(title_text="Price (₹)", row=1, col=1, fixedrange=False)
+    figure.update_yaxes(title_text="Volume", row=2, col=1, fixedrange=False)
+    figure.update_xaxes(rangeslider_visible=False, row=1, col=1)
+    return figure
+
+
+def main() -> None:
+    st.title("📈 QuantTrading")
+    st.caption("Indian cash-equity swing research · Daily data · No order placement")
+    st.info(
+        "Signals are rule-based research outputs from recent market data, not personalized financial advice. "
+        "Check the reason, data date, and your own risk limits before making any decision."
+    )
+
+    with st.sidebar:
+        st.header("Scanner")
+        st.write("Top Nifty 50 constituents by index weight, plus any symbols you add below.")
+        with st.form("custom_watchlist"):
+            added_symbols = st.text_input(
+                "Add your own Yahoo Finance symbols",
+                placeholder="WIPRO.NS, TATAMOTORS.NS",
+                help="Enter one or more symbols separated by commas. For NSE shares, Yahoo symbols usually end in .NS.",
+            )
+            st.form_submit_button("Apply symbols")
+        if st.button("Refresh market data", type="primary", width="stretch"):
+            download_history.clear()
+            st.rerun()
+        st.caption("Cached for 15 minutes. Yahoo Finance may return delayed, missing, or unavailable data.")
+        st.subheader("BUY filters")
+        max_pe = st.number_input("Maximum trailing P/E (0 disables)", min_value=0.0, max_value=300.0, value=60.0, step=5.0)
+        min_sharpe = st.number_input("Minimum 1Y Sharpe", min_value=-2.0, max_value=3.0, value=0.0, step=0.1)
+        max_drawdown_pct = st.slider("Maximum historical drawdown", min_value=10, max_value=80, value=50)
+
+    watchlist = dict(WATCHLIST)
+    for raw_symbol in added_symbols.split(","):
+        symbol = raw_symbol.strip().upper()
+        if symbol:
+            watchlist.setdefault(symbol, symbol)
+
+    results, errors = [], []
+    with st.spinner("Loading daily prices and calculating indicators…"):
+        for symbol, company in watchlist.items():
+            try:
+                results.append(evaluate(symbol, company, max_pe, min_sharpe, float(max_drawdown_pct)))
+            except Exception as exc:
+                errors.append({"Symbol": symbol, "Company": company, "Error": str(exc)[:180]})
+
+    if not results:
+        st.error("No symbols could be scanned. Check your internet connection or try again later.")
+        if errors:
+            st.dataframe(pd.DataFrame(errors), hide_index=True, width="stretch")
+        return
+
+    frame = pd.DataFrame(results)
+    buys = int((frame["Action"] == "BUY").sum())
+    exits = int(frame["Action"].str.startswith("SELL").sum())
+    holds = int((frame["Action"] == "HOLD").sum())
+    no_action = len(frame) - buys - exits - holds
+    metric_cols = st.columns(4)
+    for col, label, value in zip(metric_cols, ("BUY setups", "HOLD", "SELL review", "NO ACTION"), (buys, holds, exits, no_action)):
+        col.metric(label, value)
+
+    st.subheader("Market scan")
+    st.caption("One clear row per stock. Select a row to inspect its chart, risk levels, and rule explanation.")
+    display = frame[["Company", "Symbol", "Date", "Action", "Scenario", "Price", "Stop loss", "Target", "Reward/Risk", "Risk %", "Reward %", "P/E"]].copy()
+    display["Price"] = display["Price"].map(money)
+    for column in ("Stop loss", "Target"):
+        display[column] = display[column].map(money)
+    for column in ("Risk %", "Reward %"):
+        display[column] = display[column].map(lambda value: "—" if pd.isna(value) else f"{value:.1f}%")
+    display["Reward/Risk"] = display["Reward/Risk"].map(lambda value: "—" if pd.isna(value) else f"{value:.1f}:1")
+    display["P/E"] = display["P/E"].map(lambda value: "N/A" if pd.isna(value) else f"{value:.1f}×")
+    st.dataframe(display, hide_index=True, width="stretch", height=min(560, 42 + 40 * len(display)))
+
+    chosen = st.selectbox("Stock details", frame["Company"].tolist(), label_visibility="collapsed")
+    selected = frame.loc[frame["Company"] == chosen].iloc[0]
+    left, right = st.columns([1, 1.4], gap="large")
+    with left:
+        st.subheader(f"{selected['Company']} · {selected['Symbol']}")
+        st.metric("Rule-based action", selected["Action"])
+        st.write(f"**Latest daily candle:** {selected['Date']} · **Close:** {money(selected['Price'])}")
+        st.write(f"**Why:** {selected['Reason']}")
+        if selected["Action"] == "BUY":
+            st.write(f"**Illustrative stop loss:** {money(selected['Stop loss'])}  ")
+            st.write(f"**Illustrative target:** {money(selected['Target'])}")
+            st.caption(f"Long setup illustration: stop is {ATR_STOP_MULTIPLE:.1f} × ATR below close; target is {REWARD_RISK_RATIO:.1f}R above. Recalculate from a real entry price; gaps and costs can change outcomes.")
+        elif selected["Action"] == "SELL":
+            st.write(f"**Illustrative short stop loss:** {money(selected['Stop loss'])}  ")
+            st.write(f"**Illustrative short target:** {money(selected['Target'])}")
+            st.caption(f"Hypothetical short setup only: stop is {ATR_STOP_MULTIPLE:.1f} × ATR above close; target is {REWARD_RISK_RATIO:.1f}R below. A SELL flag is not an instruction to open a short position.")
+        else:
+            st.write(f"**Illustrative {selected['Scenario'].lower()} stop loss:** {money(selected['Stop loss'])}  ")
+            st.write(f"**Illustrative {selected['Scenario'].lower()} target:** {money(selected['Target'])}")
+            st.caption("These are ATR-based scenario levels for comparison; HOLD / NO ACTION does not mean you should enter a position.")
+        metric_columns = st.columns(3)
+        metric_columns[0].metric("ADX (14)", f"{selected['ADX (14)']:.1f}")
+        metric_columns[1].metric("CMF (20)", f"{selected['CMF (20)']:.2f}")
+        metric_columns[2].metric("P/E", "N/A" if pd.isna(selected["P/E"]) else f"{selected['P/E']:.1f}×")
+        risk_columns = st.columns(3)
+        risk_columns[0].metric("1Y stock Sharpe", "N/A" if pd.isna(selected["Sharpe 1Y"]) else f"{selected['Sharpe 1Y']:.2f}")
+        risk_columns[1].metric("1Y stock max drawdown", "N/A" if pd.isna(selected["Max DD 1Y %"]) else f"{selected['Max DD 1Y %']:.1f}%")
+        risk_columns[2].metric("Bollinger %B", f"{selected['BB %B']:.2f}")
+        st.caption(f"RSI: {selected['RSI (14)']:.1f} · Volume: {selected['Volume vs avg']:.2f}× 20-day average · ATR: {money(selected['ATR (14)'])}")
+    with right:
+        chart = download_history(selected["Symbol"])
+        chart = add_indicators(chart).tail(500)
+        st.subheader("Daily candlestick chart")
+        st.caption("Hover for open, high, low, close, and volume. Use the range buttons or drag to zoom.")
+        overlay_columns = st.columns(4)
+        show_sma20 = overlay_columns[0].checkbox("SMA 20", value=True)
+        show_sma50 = overlay_columns[1].checkbox("SMA 50", value=True)
+        show_sma200 = overlay_columns[2].checkbox("SMA 200", value=False)
+        show_bollinger = overlay_columns[3].checkbox("Bollinger", value=False)
+        chart_figure = make_candlestick_chart(chart, show_sma20, show_sma50, show_sma200, show_bollinger)
+        st.plotly_chart(chart_figure, width="stretch", config={"displaylogo": False})
+
+    with st.expander("How the actions and risk levels are calculated"):
+        st.markdown(
+            f"**BUY:** Close > SMA20 > SMA50 > SMA200, MACD > signal, RSI 50–70, volume ≥ 1.2× its 20-day average, ADX ≥ {ADX_MINIMUM:.0f}, positive CMF, close no higher than the upper Bollinger Band, and the selected Sharpe/drawdown/P/E BUY filters pass.\n\n"
+            "**HOLD:** Long-term trend and momentum are positive and CMF is not strongly negative, but one or more BUY checks fail.\n\n"
+            f"**SELL:** Price < SMA50, MACD < signal, ADX ≥ {ADX_MINIMUM:.0f}, and CMF < 0. This is a review flag, not an order. The SELL stop/target use a hypothetical short-side scenario.\n\n"
+            "**NO ACTION:** Neither BUY nor WATCH is supported by these rules. Missing or insufficient data is reported as an error.\n\n"
+            "All stocks show an ATR-based scenario: BUY, HOLD, and NO ACTION use a long-side illustration (stop = close − 2 × ATR; target = close + 2 times the stop distance); SELL uses a hypothetical short-side illustration (stop = close + 2 × ATR; target = close − 2 times the stop distance). "
+            "All levels use the latest close, not a user's actual entry price. The displayed 1Y Sharpe and drawdown describe the stock's historical buy-and-hold returns; they are not a portfolio or strategy backtest."
+        )
+        st.write("Indicators: SMA 20/50/200, Wilder RSI(14), MACD(12, 26, 9), ATR(14), Bollinger Bands(20, 2), ADX(14), CMF(20), 20-day average volume, trailing P/E, and one-year historical stock Sharpe/max drawdown.")
+
+    if errors:
+        with st.expander(f"Data issues ({len(errors)} symbols)"):
+            st.dataframe(pd.DataFrame(errors), hide_index=True, width="stretch")
+    st.caption(f"Last dashboard refresh: {datetime.now().astimezone().strftime('%d %b %Y, %H:%M %Z')} · For research and education; no trades are placed.")
+
+
+if __name__ == "__main__":
+    main()
+
