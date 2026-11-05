@@ -69,18 +69,21 @@ Choose **Flexible score** or **Strict rules** in the sidebar. Flexible score is 
 
 The sidebar lets you set a maximum P/E (0 disables the filter), a minimum one-year Sharpe, and a maximum historical drawdown for BUY setups. The summary table shows risk percentage, reward percentage, and reward/risk ratio for every stock, regardless of its action.
 
-When a BUY appears, the dashboard queues a **paper entry** for the next daily open. At that entry, it logs the entry price, fixes the initial stop at entry − 2 × signal-day ATR, and fixes the target at entry + 4 × ATR (a planned 1:2 risk-to-reward ratio). Once price reaches entry + 2.5 × ATR, the stop moves to breakeven and stays there. A SELL signal queues a paper exit at the next open. Gap risk applies, and if stop and target both fall inside one daily candle, the simulator assumes the stop was hit first.
+The dashboard classifies the market using the latest Nifty 50 close versus its 50-day SMA. Above the SMA is **Bull** mode: target = entry + 4 × signal-day ATR and breakeven trigger = +2.5 × ATR. At or below the SMA is **Defensive** mode: target = entry + 2 × ATR and breakeven trigger = +1 × ATR. If Nifty data is unavailable, BUY setups are paused.
+
+When a BUY appears, the dashboard queues a **paper entry** for the next daily open. At entry, it logs the entry price and fixes the initial stop at entry − 2 × signal-day ATR. Target and breakeven trigger multiples are saved from the signal-day market regime and remain fixed for that position if the market regime later changes. A SELL signal queues a paper exit at the next open. Gap risk applies, and if stop and target both fall inside one daily candle, the simulator assumes the stop was hit first.
 
 The **Paper trade log** is in-memory for the current browser session only. It is not connected to a broker or an actual portfolio and may clear if the app session restarts. When no paper position is open, displayed levels remain illustrative scenarios based on the latest close. No real trades are placed.
 
 ## Data and limitations
 
-The app asks yfinance for two years of daily adjusted OHLCV data, enough history for the 200-day average. Data is cached for 15 minutes; use **Refresh market data** to clear the cache. A network failure, rate limit, missing symbol, or short history is shown in the dashboard instead of stopping the whole scan.
+The app asks yfinance for two years of daily adjusted OHLCV data, enough history for the 200-day average, and separately downloads Nifty 50 closes for the regime filter. Data is cached for 15 minutes; use **Refresh market data** to clear both caches. A network failure, rate limit, missing symbol, or short history is shown in the dashboard instead of stopping the whole scan. If the Nifty data is unavailable, the stock scan continues but BUY setups are paused.
 
-This is a technical screening example for research and education. The current Update 2 settings have not yet been backtested or validated as profitable. Earlier versions had a limited one-year historical simulation; that does not predict future results. The dashboard does not consider your financial circumstances and is not personalized financial advice. It cannot know your holdings, entry price, capital, risk tolerance, or tax situation. Review the chart, data date, and rules yourself; the dashboard never connects to a broker or places trades.
+This is a technical screening example for research and education. The current Update 3 settings have not yet been backtested or validated as profitable. Earlier versions had a limited one-year historical simulation; that does not predict future results. The dashboard does not consider your financial circumstances and is not personalized financial advice. It cannot know your holdings, entry price, capital, risk tolerance, or tax situation. Review the chart, data date, and rules yourself; the dashboard never connects to a broker or places trades.
 
 ## Strategy revision history
 
 - **Pre-update:** Flexible-score BUY at +20 without an RSI crossover gate; RSI from 50–70 added bullish points, with a smaller boost above 70 through 75 (or 80 when ADX >25).
 - **Update 1:** Required RSI to cross up through 50 (RSI ≤65) for BUY; added the session paper-trade log with a fixed 2 × ATR initial stop, 4 × ATR target, and breakeven move at +1.5 × ATR.
 - **Update 2:** Restores score-based BUY at +20 and the pre-update RSI weighting/ceilings; keeps the entry-anchored 2 × ATR stop and 4 × ATR target, and moves the breakeven trigger to +2.5 × ATR.
+- **Update 3:** Adds a Nifty 50 / SMA 50 regime filter. Bull mode uses a 4 × ATR target and +2.5 × ATR breakeven trigger; Defensive mode uses a 2 × ATR target and +1 × ATR breakeven trigger. The regime-specific multiples are locked at signal time; price levels are anchored to the next-open paper entry.

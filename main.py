@@ -26,12 +26,15 @@ WATCHLIST = {
 }
 
 HISTORY_PERIOD = "2y"  # Gives enough daily candles for the 200-day average.
+NIFTY_INDEX_SYMBOL = "^NSEI"
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 VOLUME_AVERAGE_PERIOD = 20
 ATR_STOP_MULTIPLE = 2.0
-REWARD_RISK_RATIO = 2.0
-BREAKEVEN_TRIGGER_ATR = 2.5
+BULL_TARGET_ATR = 4.0
+BULL_BREAKEVEN_TRIGGER_ATR = 2.5
+DEFENSIVE_TARGET_ATR = 2.0
+DEFENSIVE_BREAKEVEN_TRIGGER_ATR = 1.0
 BUY_VOLUME_MULTIPLE = 1.2
 ADX_MINIMUM = 20.0
 CMF_PERIOD = 20
@@ -77,6 +80,70 @@ def download_history(symbol: str) -> pd.DataFrame:
     for column in required:
         data[column] = pd.to_numeric(data[column], errors="coerce")
     return data.dropna(subset=["Close"])
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def download_nifty_close() -> pd.Series:
+    """Fetch Nifty 50 daily closes for the broad-market regime filter."""
+    data = yf.download(
+        NIFTY_INDEX_SYMBOL,
+        period=HISTORY_PERIOD,
+        interval="1d",
+        auto_adjust=True,
+        multi_level_index=False,
+        progress=False,
+        threads=False,
+        timeout=20,
+    )
+    if data is None or data.empty:
+        raise ValueError("No Nifty 50 index data returned.")
+
+    if isinstance(data.columns, pd.MultiIndex):
+        close_column = next(
+            (column for column in data.columns if any(str(part).strip().lower() == "close" for part in column)),
+            None,
+        )
+        if close_column is None:
+            raise ValueError("Nifty 50 index data has no Close field.")
+        close = data[close_column]
+    else:
+        close_column = next((column for column in data.columns if str(column).strip().lower() == "close"), None)
+        if close_column is None:
+            raise ValueError("Nifty 50 index data has no Close field.")
+        close = data[close_column]
+
+    close = pd.to_numeric(close, errors="coerce").dropna()
+    close.name = "Close"
+    if close.empty:
+        raise ValueError("Nifty 50 index closes are unavailable.")
+    return close
+
+
+def get_market_regime() -> dict:
+    """Classify the broad market using the latest Nifty 50 close and SMA 50."""
+    try:
+        close = download_nifty_close()
+        if len(close) < 50:
+            raise ValueError("At least 50 daily closes are needed for the Nifty 50 SMA.")
+        sma50 = close.rolling(50, min_periods=50).mean().iloc[-1]
+        latest_close = float(close.iloc[-1])
+        latest_sma50 = float(sma50)
+        return {
+            "name": "Bull" if latest_close > latest_sma50 else "Defensive",
+            "close": latest_close,
+            "sma50": latest_sma50,
+            "date": pd.Timestamp(close.index[-1]).strftime("%d %b %Y"),
+            "error": None,
+        }
+    except Exception as exc:
+        return {"name": "Unavailable", "close": None, "sma50": None, "date": None, "error": str(exc)[:180]}
+
+
+def market_risk_parameters(market_regime: str) -> tuple[float, float]:
+    """Return target and breakeven-trigger ATR multiples for a market regime."""
+    if market_regime == "Bull":
+        return BULL_TARGET_ATR, BULL_BREAKEVEN_TRIGGER_ATR
+    return DEFENSIVE_TARGET_ATR, DEFENSIVE_BREAKEVEN_TRIGGER_ATR
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -190,6 +257,7 @@ def evaluate(
     min_sharpe: float,
     max_drawdown_pct: float,
     signal_mode: str,
+    market_regime: str,
 ) -> dict:
     """Score indicators or apply the visible rules, then calculate ATR-based levels."""
     history = add_indicators(download_history(symbol))
@@ -211,6 +279,7 @@ def evaluate(
     sharpe_1y = float(last["Sharpe 1Y"]) if pd.notna(last["Sharpe 1Y"]) else None
     max_dd_1y_pct = float(last["Max DD 1Y %"]) if pd.notna(last["Max DD 1Y %"]) else None
     pe = download_pe(symbol)
+    target_atr_multiple, breakeven_trigger_atr = market_risk_parameters(market_regime)
 
     pe_ok = max_pe <= 0 or pe is None or (0 < pe <= max_pe)
     sharpe_ok = sharpe_1y is None or sharpe_1y >= min_sharpe
@@ -277,7 +346,7 @@ def evaluate(
         action = "BUY"
         reason = "Trend, momentum, volatility, volume-flow, valuation, and historical-risk filters all pass."
         stop = price - ATR_STOP_MULTIPLE * atr
-        target = price + REWARD_RISK_RATIO * (price - stop)
+        target = price + target_atr_multiple * atr
     elif watch_ok:
         action = "HOLD"
         failed = [name for name, passed in buy_checks.items() if not passed]
@@ -301,30 +370,35 @@ def evaluate(
         reason = "; ".join(failed) or "The BUY and WATCH rules are not met."
         stop = target = None
 
+    if action == "BUY" and market_regime == "Unavailable":
+        action = "NO ACTION"
+        reason += " Nifty 50 regime is unavailable, so no BUY is allowed until the market filter can be calculated."
+
     # Always show a comparable ATR scenario. SELL uses a hypothetical short;
     # BUY, HOLD, and NO ACTION use an illustrative long scenario.
     scenario = "Short" if action == "SELL" else "Long"
     if stop is None:
         if scenario == "Short":
             stop = price + ATR_STOP_MULTIPLE * atr
-            target = price - REWARD_RISK_RATIO * (stop - price)
+            target = price - target_atr_multiple * atr
         else:
             stop = price - ATR_STOP_MULTIPLE * atr
-            target = price + REWARD_RISK_RATIO * (price - stop)
+            target = price + target_atr_multiple * atr
 
     risk_pct = (abs(price - stop) / price * 100) if stop is not None else None
     reward_pct = (abs(target - price) / price * 100) if target is not None else None
     date = pd.Timestamp(history.index[-1]).strftime("%d %b %Y")
     return {
         "Symbol": symbol, "Company": company, "Date": date, "Action": action, "Rating": rating,
-        "Score": score, "Scenario": scenario, "Reason": reason,
+        "Score": score, "Scenario": scenario, "Reason": reason, "Market regime": market_regime,
+        "Target ATR multiple": target_atr_multiple, "Breakeven trigger ATR": breakeven_trigger_atr,
         "Price": price, "Stop loss": stop, "Target": target, "Risk %": risk_pct,
         "Reward %": reward_pct, "RSI (14)": rsi, "Trend": "Bullish" if price > sma50 > sma200 else "Mixed / weak",
         "Volume vs avg": volume_ratio, "SMA20": sma20, "SMA50": sma50, "SMA200": sma200,
         "MACD": macd, "MACD Signal": macd_signal, "ATR (14)": atr, "ADX (14)": adx,
         "CMF (20)": cmf, "BB %B": bb_percent_b, "P/E": pe,
         "Sharpe 1Y": sharpe_1y, "Max DD 1Y %": max_dd_1y_pct,
-        "Reward/Risk": (abs(target - price) / abs(price - stop)) if stop is not None and price != stop else None,
+        "Reward/Risk": target_atr_multiple / ATR_STOP_MULTIPLE,
     }
 
 
@@ -344,12 +418,16 @@ def update_paper_positions(results: list[dict], signal_mode: str) -> None:
                 "signal_date": latest_date,
                 "entry_atr": float(result["ATR (14)"]),
                 "mode": signal_mode,
+                "market_regime": result["Market regime"],
+                "target_atr_multiple": float(result["Target ATR multiple"]),
+                "breakeven_trigger_atr": float(result["Breakeven trigger ATR"]),
             }
             positions[symbol] = position
 
         if position is None:
             result["Paper status"] = "No paper position"
             result["Paper entry"] = None
+            result["Paper regime"] = None
             continue
 
         signal_date = position["signal_date"]
@@ -369,8 +447,8 @@ def update_paper_positions(results: list[dict], signal_mode: str) -> None:
                     "entry_date": pd.Timestamp(bar_date),
                     "initial_stop": initial_stop,
                     "stop": initial_stop,
-                    "target": entry + REWARD_RISK_RATIO * (entry - initial_stop),
-                    "breakeven_trigger": entry + BREAKEVEN_TRIGGER_ATR * entry_atr,
+                    "target": entry + position["target_atr_multiple"] * entry_atr,
+                    "breakeven_trigger": entry + position["breakeven_trigger_atr"] * entry_atr,
                     "breakeven_active": False,
                     "last_processed_date": pd.Timestamp(signal_date),
                 })
@@ -408,12 +486,15 @@ def update_paper_positions(results: list[dict], signal_mode: str) -> None:
                 closed_trades.append({
                     "Symbol": symbol,
                     "Mode": position["mode"],
+                    "Market regime": position["market_regime"],
                     "Entry date": position["entry_date"].strftime("%d %b %Y"),
                     "Exit date": pd.Timestamp(bar_date).strftime("%d %b %Y"),
                     "Entry": entry,
                     "Exit": exit_price,
                     "Return %": (exit_price / entry - 1) * 100,
                     "Result R": (exit_price - entry) / initial_risk,
+                    "Target ATR": position["target_atr_multiple"],
+                    "Breakeven trigger ATR": position["breakeven_trigger_atr"],
                     "Exit reason": closed_reason,
                 })
                 positions.pop(symbol, None)
@@ -423,6 +504,7 @@ def update_paper_positions(results: list[dict], signal_mode: str) -> None:
         if position is None:
             result["Paper status"] = f"Closed: {closed_reason}"
             result["Paper entry"] = None
+            result["Paper regime"] = None
             continue
 
         if (
@@ -437,17 +519,21 @@ def update_paper_positions(results: list[dict], signal_mode: str) -> None:
         if position["status"] == "pending":
             result["Paper status"] = "Entry queued · next session open"
             result["Paper entry"] = None
+            result["Paper regime"] = position["market_regime"]
         else:
             if position.get("pending_exit"):
                 result["Paper status"] = "Exit queued · next session open"
             else:
                 result["Paper status"] = "Active · breakeven stop" if position["breakeven_active"] else "Active"
             result["Paper entry"] = position["entry_price"]
+            result["Paper regime"] = position["market_regime"]
+            result["Target ATR multiple"] = position["target_atr_multiple"]
+            result["Breakeven trigger ATR"] = position["breakeven_trigger_atr"]
             result["Stop loss"] = position["stop"]
             result["Target"] = position["target"]
             result["Risk %"] = max(position["entry_price"] - position["stop"], 0) / position["entry_price"] * 100
             result["Reward %"] = (position["target"] - position["entry_price"]) / position["entry_price"] * 100
-            result["Reward/Risk"] = REWARD_RISK_RATIO
+            result["Reward/Risk"] = (position["target"] - position["entry_price"]) / (position["entry_price"] - position["initial_stop"])
 
 
 def money(value):
@@ -557,12 +643,25 @@ def main() -> None:
             st.form_submit_button("Apply symbols")
         if st.button("Refresh market data", type="primary", width="stretch"):
             download_history.clear()
+            download_nifty_close.clear()
             st.rerun()
         st.caption("Cached for 15 minutes. Yahoo Finance may return delayed, missing, or unavailable data.")
         st.subheader("BUY filters")
         max_pe = st.number_input("Maximum trailing P/E (0 disables)", min_value=0.0, max_value=300.0, value=60.0, step=5.0)
         min_sharpe = st.number_input("Minimum 1Y Sharpe", min_value=-2.0, max_value=3.0, value=0.0, step=0.1)
         max_drawdown_pct = st.slider("Maximum historical drawdown", min_value=10, max_value=80, value=50)
+
+    market = get_market_regime()
+    market_columns = st.columns([1, 2])
+    market_columns[0].metric("Nifty 50 regime", market["name"])
+    if market["name"] != "Unavailable":
+        market_columns[1].caption(
+            f"Nifty 50 close {market['close']:,.2f} vs. 50-day SMA {market['sma50']:,.2f} "
+            f"on {market['date']}. Bull mode uses a 4× ATR target and 2.5× ATR breakeven trigger; "
+            "defensive mode uses 2× ATR and 1× ATR."
+        )
+    else:
+        st.warning(f"Nifty 50 regime data is unavailable: {market['error']} BUY setups are paused until it loads.")
 
     watchlist = dict(WATCHLIST)
     for raw_symbol in added_symbols.split(","):
@@ -574,7 +673,7 @@ def main() -> None:
     with st.spinner("Loading daily prices and calculating indicators…"):
         for symbol, company in watchlist.items():
             try:
-                results.append(evaluate(symbol, company, max_pe, min_sharpe, float(max_drawdown_pct), signal_mode))
+                results.append(evaluate(symbol, company, max_pe, min_sharpe, float(max_drawdown_pct), signal_mode, market["name"]))
             except Exception as exc:
                 errors.append({"Symbol": symbol, "Company": company, "Error": str(exc)[:180]})
 
@@ -616,25 +715,46 @@ def main() -> None:
         score_cols[0].metric("Score rating", selected["Rating"])
         score_cols[1].metric("Directional score", f"{selected['Score']:+d}/100")
         st.write(f"**Latest daily candle:** {selected['Date']} · **Close:** {money(selected['Price'])}")
+        st.write(f"**Current market regime:** {selected['Market regime']}")
         st.write(f"**Why:** {selected['Reason']}")
         st.write(f"**Paper tracking:** {selected['Paper status']}")
         if selected["Paper status"].startswith("Active") or selected["Paper status"].startswith("Exit queued"):
             st.write(f"**Paper entry:** {money(selected['Paper entry'])} · **Current stop:** {money(selected['Stop loss'])} · **Fixed target:** {money(selected['Target'])}")
             position = st.session_state.get("paper_positions", {}).get(selected["Symbol"], {})
             if position.get("breakeven_active"):
-                st.caption(f"The original 2 × ATR stop has moved to the paper entry price after a {BREAKEVEN_TRIGGER_ATR:.1f} × ATR favorable move.")
+                st.caption(
+                    f"{position['market_regime']} regime at entry: stop moved to breakeven after "
+                    f"a {position['breakeven_trigger_atr']:.1f} × ATR favorable move; target is "
+                    f"{position['target_atr_multiple']:.1f} × ATR from entry."
+                )
             else:
-                st.caption(f"The paper entry and initial 2 × ATR stop are fixed; a {BREAKEVEN_TRIGGER_ATR:.1f} × ATR favorable move will move the stop to breakeven.")
+                st.caption(
+                    f"{position['market_regime']} regime at entry: initial 2 × ATR stop and "
+                    f"{position['target_atr_multiple']:.1f} × ATR target are fixed; breakeven triggers after "
+                    f"a {position['breakeven_trigger_atr']:.1f} × ATR favorable move."
+                )
         elif selected["Paper status"].startswith("Entry queued"):
-            st.caption("A paper entry is queued for the next session's open. Its stop and target will be fixed from that entry price and the signal day's ATR.")
+            position = st.session_state.get("paper_positions", {}).get(selected["Symbol"], {})
+            st.caption(
+                f"A paper entry is queued for the next open using {position.get('market_regime', 'current')} regime settings: "
+                f"2 × ATR initial stop, {position.get('target_atr_multiple', selected['Target ATR multiple']):.1f} × ATR target, "
+                f"and breakeven after {position.get('breakeven_trigger_atr', selected['Breakeven trigger ATR']):.1f} × ATR."
+            )
         elif selected["Action"] == "BUY":
             st.write(f"**Illustrative stop loss:** {money(selected['Stop loss'])}  ")
             st.write(f"**Illustrative target:** {money(selected['Target'])}")
-            st.caption(f"Long setup illustration: stop is {ATR_STOP_MULTIPLE:.1f} × ATR below close; target is {REWARD_RISK_RATIO:.1f}R above. Recalculate from a real entry price; gaps and costs can change outcomes.")
+            st.caption(
+                f"{selected['Market regime']} regime illustration: 2 × ATR stop, "
+                f"{selected['Target ATR multiple']:.1f} × ATR target, breakeven after "
+                f"{selected['Breakeven trigger ATR']:.1f} × ATR. Recalculate from an actual entry; gaps and costs can change outcomes."
+            )
         elif selected["Action"] == "SELL":
             st.write(f"**Illustrative short stop loss:** {money(selected['Stop loss'])}  ")
             st.write(f"**Illustrative short target:** {money(selected['Target'])}")
-            st.caption(f"Hypothetical short setup only: stop is {ATR_STOP_MULTIPLE:.1f} × ATR above close; target is {REWARD_RISK_RATIO:.1f}R below. A SELL flag is not an instruction to open a short position.")
+            st.caption(
+                f"Hypothetical short illustration under {selected['Market regime']} regime: 2 × ATR stop and "
+                f"{selected['Target ATR multiple']:.1f} × ATR target. A SELL flag is not an instruction to open a short position."
+            )
         else:
             st.write(f"**Illustrative {selected['Scenario'].lower()} stop loss:** {money(selected['Stop loss'])}  ")
             st.write(f"**Illustrative {selected['Scenario'].lower()} target:** {money(selected['Target'])}")
@@ -669,20 +789,26 @@ def main() -> None:
                 active_rows.append({
                     "Symbol": symbol,
                     "Mode": position["mode"],
+                    "Regime at entry": position["market_regime"],
                     "Entry date": position["entry_date"].strftime("%d %b %Y"),
                     "Entry": money(position["entry_price"]),
                     "Stop": money(position["stop"]),
                     "Target": money(position["target"]),
+                    "Target ATR": f"{position['target_atr_multiple']:.1f}×",
+                    "Breakeven trigger ATR": f"{position['breakeven_trigger_atr']:.1f}×",
                     "Status": "Breakeven stop active" if position["breakeven_active"] else "Open",
                 })
             elif position["status"] == "pending":
                 active_rows.append({
                     "Symbol": symbol,
                     "Mode": position["mode"],
+                    "Regime at entry": position["market_regime"],
                     "Entry date": position["signal_date"].strftime("%d %b %Y"),
                     "Entry": "Next session open",
                     "Stop": "Set at entry",
                     "Target": "Set at entry",
+                    "Target ATR": f"{position['target_atr_multiple']:.1f}×",
+                    "Breakeven trigger ATR": f"{position['breakeven_trigger_atr']:.1f}×",
                     "Status": "Entry queued",
                 })
         if active_rows:
@@ -698,14 +824,15 @@ def main() -> None:
             closed_display["Return %"] = closed_display["Return %"].map(lambda value: f"{value:+.1f}%")
             closed_display["Result R"] = closed_display["Result R"].map(lambda value: f"{value:+.2f}R")
             st.dataframe(closed_display, hide_index=True, width="stretch")
-        st.caption("Paper entries use the next daily open and fixed ATR levels. This log is private to this browser session, is not connected to a broker, and may clear when the app session restarts.")
+        st.caption("Paper entries use the next daily open and lock the signal day's Nifty regime, stop, target, and breakeven trigger. This log is private to this browser session, is not connected to a broker, and may clear when the app session restarts.")
 
     with st.expander("How the actions and risk levels are calculated"):
         st.markdown(
             "**Flexible score:** Indicator evidence is combined into a directional score from −100 to +100. +55 and above = Strong Buy; +20 to +54 = Buy; −19 to +19 = Hold; −20 to −54 = Sell; −55 and below = Strong Sell. A BUY action starts at score ≥+20; SELL starts at −20. RSI from 50–70 contributes bullish points, with RSI above 70 receiving a smaller boost through 75, or 80 when ADX >25. Ratings are weighted summaries, not probabilities. Missing optional P/E, Sharpe, or drawdown values are omitted and remaining weights are rescaled.\n\n"
             f"The score weighs price/SMA20, SMA20/SMA50, and SMA50/SMA200 (10 points each); MACD (12); RSI (10); high-volume candle, ADX, CMF, and Bollinger position (8 each); 1Y Sharpe and maximum drawdown (6 each); and available P/E (4).\n\n"
             f"**Strict rules:** Requires Close > SMA20 > SMA50 > SMA200, MACD > signal, RSI from 50 to 75 (allowed up to 80 when ADX >25), volume ≥1.2× its 20-day average, ADX ≥{ADX_MINIMUM:.0f}, positive CMF, Bollinger %B ≤1.10, and the selected Sharpe/drawdown/P/E filters to pass. RSI need not cross 50 on the signal candle.\n\n"
-            f"**Paper trade management:** A BUY queues a virtual entry at the next daily open. At entry, the initial stop is fixed at entry − 2 × the signal day's ATR and the target is fixed at entry + 4 × ATR. If price reaches entry + {BREAKEVEN_TRIGGER_ATR:.1f} × ATR, the stop moves to the entry price and remains there. If stop and target are both touched in one daily candle, the stop is assumed first; gaps through a stop are filled at the open. A SELL signal queues an exit for the next session open. This is a session-only paper log, not a brokerage position or an order.\n\n"
+            f"**Market regime:** Nifty 50 above its 50-day SMA selects Bull mode (4 × ATR target; breakeven after +2.5 × ATR). At or below its 50-day SMA selects Defensive mode (2 × ATR target; breakeven after +1.0 × ATR). If the index data is unavailable, BUY setups are paused.\n\n"
+            "**Paper trade management:** A BUY queues a virtual entry at the next daily open. At entry, the initial stop is fixed at entry − 2 × the signal day's ATR. Target and breakeven trigger multiples are captured from the signal-day Nifty regime and stay fixed for that position, even if the regime later changes. If stop and target are both touched in one daily candle, the stop is assumed first; gaps through a stop are filled at the open. A SELL signal queues an exit for the next session open. This is a session-only paper log, not a brokerage position or an order.\n\n"
             "In Strict rules mode, the score rating is extra context while Action follows the all-checks rule. **HOLD** means long-term trend and momentum are positive but some BUY checks fail. **SELL** is a review flag; in score mode it reflects a bearish indicator balance, while in strict mode it requires price < SMA50, MACD < signal, ADX ≥20, and CMF <0. Insufficient required data is reported as an error. The displayed 1Y Sharpe and drawdown are historical stock statistics, not a strategy backtest."
         )
         st.write("Indicators: SMA 20/50/200, Wilder RSI(14), MACD(12, 26, 9), ATR(14), Bollinger Bands(20, 2), ADX(14), CMF(20), 20-day average volume, trailing P/E, and one-year historical stock Sharpe/max drawdown.")
