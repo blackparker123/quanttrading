@@ -31,6 +31,7 @@ ATR_PERIOD = 14
 VOLUME_AVERAGE_PERIOD = 20
 ATR_STOP_MULTIPLE = 2.0
 REWARD_RISK_RATIO = 2.0
+BREAKEVEN_TRIGGER_ATR = 2.5
 BUY_VOLUME_MULTIPLE = 1.2
 ADX_MINIMUM = 20.0
 CMF_PERIOD = 20
@@ -201,8 +202,6 @@ def evaluate(
     open_price = float(last["Open"])
     sma20, sma50, sma200 = (float(last[name]) for name in ("SMA20", "SMA50", "SMA200"))
     rsi = float(last["RSI"])
-    previous_rsi = float(history["RSI"].iloc[-2]) if len(history) > 1 and pd.notna(history["RSI"].iloc[-2]) else float("nan")
-    rsi_cross_up_50 = previous_rsi < 50 <= rsi
     macd, macd_signal = float(last["MACD"]), float(last["MACD Signal"])
     atr = float(last["ATR"])
     volume_ratio = float(last["Volume"] / last["Volume Avg"]) if last["Volume Avg"] else 0.0
@@ -216,13 +215,14 @@ def evaluate(
     pe_ok = max_pe <= 0 or pe is None or (0 < pe <= max_pe)
     sharpe_ok = sharpe_1y is None or sharpe_1y >= min_sharpe
     drawdown_ok = max_dd_1y_pct is None or max_dd_1y_pct >= -max_drawdown_pct
+    rsi_buy_ceiling = 80 if adx > 25 else 75
 
     buy_checks = {
         "Price above 20-day average": price > sma20,
         "20-day average above 50-day": sma20 > sma50,
         "50-day average above 200-day": sma50 > sma200,
         "MACD above signal": macd > macd_signal,
-        "RSI crossed up through 50 and is no higher than 65": rsi_cross_up_50 and rsi <= 65,
+        f"RSI is between 50 and {rsi_buy_ceiling}": 50 <= rsi <= rsi_buy_ceiling,
         f"Volume at least {BUY_VOLUME_MULTIPLE:.1f}× its 20-day average": volume_ratio >= BUY_VOLUME_MULTIPLE,
         f"ADX confirms trend (≥ {ADX_MINIMUM:.0f})": adx >= ADX_MINIMUM,
         "CMF confirms positive volume flow": cmf > 0,
@@ -238,14 +238,10 @@ def evaluate(
         ("SMA 50 vs SMA 200", 10, 1.0 if sma50 > sma200 else -1.0),
         ("MACD vs signal", 12, 1.0 if macd > macd_signal else -1.0),
     ]
-    if rsi_cross_up_50 and rsi <= 65:
+    if 50 <= rsi <= 70:
         rsi_signal = 1.0
-    elif 50 <= rsi <= 55:
-        rsi_signal = 0.25
-    elif 55 < rsi <= 65:
-        rsi_signal = 0.0
-    elif rsi > 65:
-        rsi_signal = -1.0
+    elif 70 < rsi <= rsi_buy_ceiling:
+        rsi_signal = 0.6
     elif 45 <= rsi < 50:
         rsi_signal = -0.2
     elif 35 <= rsi < 45:
@@ -274,10 +270,8 @@ def evaluate(
     score, rating, score_reason = weighted_score(factors)
 
     if signal_mode == "Flexible score":
-        action = "BUY" if score >= 20 and rsi_cross_up_50 and rsi <= 65 else ("SELL" if score <= -20 else "HOLD")
-        reason = score_reason + " BUY requires a fresh RSI cross above 50 (RSI ≤65) and score ≥+20; SELL starts at −20."
-        if score >= 20 and not (rsi_cross_up_50 and rsi <= 65):
-            reason += " Score is bullish, but the RSI entry trigger has not occurred on this daily candle."
+        action = "BUY" if score >= 20 else ("SELL" if score <= -20 else "HOLD")
+        reason = score_reason + " BUY starts at +20; SELL starts at −20."
         stop = target = None
     elif all(buy_checks.values()):
         action = "BUY"
@@ -324,7 +318,6 @@ def evaluate(
     return {
         "Symbol": symbol, "Company": company, "Date": date, "Action": action, "Rating": rating,
         "Score": score, "Scenario": scenario, "Reason": reason,
-        "RSI Cross Up 50": rsi_cross_up_50,
         "Price": price, "Stop loss": stop, "Target": target, "Risk %": risk_pct,
         "Reward %": reward_pct, "RSI (14)": rsi, "Trend": "Bullish" if price > sma50 > sma200 else "Mixed / weak",
         "Volume vs avg": volume_ratio, "SMA20": sma20, "SMA50": sma50, "SMA200": sma200,
@@ -345,7 +338,7 @@ def update_paper_positions(results: list[dict], signal_mode: str) -> None:
         history = add_indicators(download_history(symbol))
         latest_date = pd.Timestamp(history.index[-1])
         position = positions.get(symbol)
-        if position is None and result["Action"] == "BUY" and result["RSI Cross Up 50"]:
+        if position is None and result["Action"] == "BUY":
             position = {
                 "status": "pending",
                 "signal_date": latest_date,
@@ -377,7 +370,7 @@ def update_paper_positions(results: list[dict], signal_mode: str) -> None:
                     "initial_stop": initial_stop,
                     "stop": initial_stop,
                     "target": entry + REWARD_RISK_RATIO * (entry - initial_stop),
-                    "breakeven_trigger": entry + 1.5 * entry_atr,
+                    "breakeven_trigger": entry + BREAKEVEN_TRIGGER_ATR * entry_atr,
                     "breakeven_active": False,
                     "last_processed_date": pd.Timestamp(signal_date),
                 })
@@ -629,9 +622,9 @@ def main() -> None:
             st.write(f"**Paper entry:** {money(selected['Paper entry'])} · **Current stop:** {money(selected['Stop loss'])} · **Fixed target:** {money(selected['Target'])}")
             position = st.session_state.get("paper_positions", {}).get(selected["Symbol"], {})
             if position.get("breakeven_active"):
-                st.caption("The original 2 × ATR stop has moved to the paper entry price after a 1.5 × ATR favorable move.")
+                st.caption(f"The original 2 × ATR stop has moved to the paper entry price after a {BREAKEVEN_TRIGGER_ATR:.1f} × ATR favorable move.")
             else:
-                st.caption("The paper entry and initial 2 × ATR stop are fixed; a 1.5 × ATR favorable move will move the stop to breakeven.")
+                st.caption(f"The paper entry and initial 2 × ATR stop are fixed; a {BREAKEVEN_TRIGGER_ATR:.1f} × ATR favorable move will move the stop to breakeven.")
         elif selected["Paper status"].startswith("Entry queued"):
             st.caption("A paper entry is queued for the next session's open. Its stop and target will be fixed from that entry price and the signal day's ATR.")
         elif selected["Action"] == "BUY":
@@ -709,10 +702,10 @@ def main() -> None:
 
     with st.expander("How the actions and risk levels are calculated"):
         st.markdown(
-            "**Flexible score:** Indicator evidence is combined into a directional score from −100 to +100. +55 and above = Strong Buy; +20 to +54 = Buy; −19 to +19 = Hold; −20 to −54 = Sell; −55 and below = Strong Sell. A BUY action requires score ≥+20 plus a fresh RSI cross upward through 50 with RSI ≤65. SELL starts at −20. Ratings are weighted summaries, not probabilities. Missing optional P/E, Sharpe, or drawdown values are omitted and remaining weights are rescaled.\n\n"
+            "**Flexible score:** Indicator evidence is combined into a directional score from −100 to +100. +55 and above = Strong Buy; +20 to +54 = Buy; −19 to +19 = Hold; −20 to −54 = Sell; −55 and below = Strong Sell. A BUY action starts at score ≥+20; SELL starts at −20. RSI from 50–70 contributes bullish points, with RSI above 70 receiving a smaller boost through 75, or 80 when ADX >25. Ratings are weighted summaries, not probabilities. Missing optional P/E, Sharpe, or drawdown values are omitted and remaining weights are rescaled.\n\n"
             f"The score weighs price/SMA20, SMA20/SMA50, and SMA50/SMA200 (10 points each); MACD (12); RSI (10); high-volume candle, ADX, CMF, and Bollinger position (8 each); 1Y Sharpe and maximum drawdown (6 each); and available P/E (4).\n\n"
-            f"**Strict rules:** Requires Close > SMA20 > SMA50 > SMA200, MACD > signal, RSI crossing upward through 50 and ≤65, volume ≥1.2× its 20-day average, ADX ≥{ADX_MINIMUM:.0f}, positive CMF, Bollinger %B ≤1.10, and the selected Sharpe/drawdown/P/E filters to pass.\n\n"
-            "**Paper trade management:** A BUY queues a virtual entry at the next daily open. At entry, the initial stop is fixed at entry − 2 × the signal day's ATR and the target is fixed at entry + 4 × ATR. If price reaches entry + 1.5 × ATR, the stop moves to the entry price and remains there. If stop and target are both touched in one daily candle, the stop is assumed first; gaps through a stop are filled at the open. A SELL signal queues an exit for the next session open. This is a session-only paper log, not a brokerage position or an order.\n\n"
+            f"**Strict rules:** Requires Close > SMA20 > SMA50 > SMA200, MACD > signal, RSI from 50 to 75 (allowed up to 80 when ADX >25), volume ≥1.2× its 20-day average, ADX ≥{ADX_MINIMUM:.0f}, positive CMF, Bollinger %B ≤1.10, and the selected Sharpe/drawdown/P/E filters to pass. RSI need not cross 50 on the signal candle.\n\n"
+            f"**Paper trade management:** A BUY queues a virtual entry at the next daily open. At entry, the initial stop is fixed at entry − 2 × the signal day's ATR and the target is fixed at entry + 4 × ATR. If price reaches entry + {BREAKEVEN_TRIGGER_ATR:.1f} × ATR, the stop moves to the entry price and remains there. If stop and target are both touched in one daily candle, the stop is assumed first; gaps through a stop are filled at the open. A SELL signal queues an exit for the next session open. This is a session-only paper log, not a brokerage position or an order.\n\n"
             "In Strict rules mode, the score rating is extra context while Action follows the all-checks rule. **HOLD** means long-term trend and momentum are positive but some BUY checks fail. **SELL** is a review flag; in score mode it reflects a bearish indicator balance, while in strict mode it requires price < SMA50, MACD < signal, ADX ≥20, and CMF <0. Insufficient required data is reported as an error. The displayed 1Y Sharpe and drawdown are historical stock statistics, not a strategy backtest."
         )
         st.write("Indicators: SMA 20/50/200, Wilder RSI(14), MACD(12, 26, 9), ATR(14), Bollinger Bands(20, 2), ADX(14), CMF(20), 20-day average volume, trailing P/E, and one-year historical stock Sharpe/max drawdown.")
