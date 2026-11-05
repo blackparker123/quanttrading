@@ -33,8 +33,8 @@ VOLUME_AVERAGE_PERIOD = 20
 ATR_STOP_MULTIPLE = 2.0
 BULL_TARGET_ATR = 4.0
 BULL_BREAKEVEN_TRIGGER_ATR = 2.5
-DEFENSIVE_TARGET_ATR = 2.0
-DEFENSIVE_BREAKEVEN_TRIGGER_ATR = 1.0
+DEFENSIVE_TARGET_ATR = 3.0
+DEFENSIVE_BREAKEVEN_TRIGGER_ATR = 2.0
 BUY_VOLUME_MULTIPLE = 1.2
 ADX_MINIMUM = 20.0
 CMF_PERIOD = 20
@@ -120,23 +120,23 @@ def download_nifty_close() -> pd.Series:
 
 
 def get_market_regime() -> dict:
-    """Classify the broad market using the latest Nifty 50 close and SMA 50."""
+    """Classify the broad market using the latest Nifty 50 close and SMA 200."""
     try:
         close = download_nifty_close()
-        if len(close) < 50:
-            raise ValueError("At least 50 daily closes are needed for the Nifty 50 SMA.")
-        sma50 = close.rolling(50, min_periods=50).mean().iloc[-1]
+        if len(close) < 200:
+            raise ValueError("At least 200 daily closes are needed for the Nifty 50 SMA.")
+        sma200 = close.rolling(200, min_periods=200).mean().iloc[-1]
         latest_close = float(close.iloc[-1])
-        latest_sma50 = float(sma50)
+        latest_sma200 = float(sma200)
         return {
-            "name": "Bull" if latest_close > latest_sma50 else "Defensive",
+            "name": "Bull" if latest_close > latest_sma200 else "Defensive",
             "close": latest_close,
-            "sma50": latest_sma50,
+            "sma200": latest_sma200,
             "date": pd.Timestamp(close.index[-1]).strftime("%d %b %Y"),
             "error": None,
         }
     except Exception as exc:
-        return {"name": "Unavailable", "close": None, "sma50": None, "date": None, "error": str(exc)[:180]}
+        return {"name": "Unavailable", "close": None, "sma200": None, "date": None, "error": str(exc)[:180]}
 
 
 def market_risk_parameters(market_regime: str) -> tuple[float, float]:
@@ -291,7 +291,7 @@ def evaluate(
         "20-day average above 50-day": sma20 > sma50,
         "50-day average above 200-day": sma50 > sma200,
         "MACD above signal": macd > macd_signal,
-        f"RSI is between 50 and {rsi_buy_ceiling}": 50 <= rsi <= rsi_buy_ceiling,
+        "RSI is strictly between 40 and 70": 40 < rsi < 70,
         f"Volume at least {BUY_VOLUME_MULTIPLE:.1f}× its 20-day average": volume_ratio >= BUY_VOLUME_MULTIPLE,
         f"ADX confirms trend (≥ {ADX_MINIMUM:.0f})": adx >= ADX_MINIMUM,
         "CMF confirms positive volume flow": cmf > 0,
@@ -337,10 +337,14 @@ def evaluate(
         pe_signal = -1.0 if pe <= 0 else (0.5 if pe <= max_pe else -0.5)
         factors.append(("Trailing P/E filter", 4, pe_signal))
     score, rating, score_reason = weighted_score(factors)
+    buy_checks["Directional score is at least +20"] = score >= 20
 
     if signal_mode == "Flexible score":
-        action = "BUY" if score >= 20 else ("SELL" if score <= -20 else "HOLD")
-        reason = score_reason + " BUY starts at +20; SELL starts at −20."
+        rsi_entry_ok = 40 < rsi < 70
+        action = "BUY" if score >= 20 and rsi_entry_ok else ("SELL" if score <= -20 else "HOLD")
+        reason = score_reason + " BUY requires score ≥+20 and RSI strictly between 40 and 70; SELL starts at −20."
+        if score >= 20 and not rsi_entry_ok:
+            reason += " The score is bullish, but RSI is outside the BUY entry range."
         stop = target = None
     elif all(buy_checks.values()):
         action = "BUY"
@@ -672,9 +676,9 @@ def main() -> None:
     market_columns[0].metric("Nifty 50 regime", market["name"])
     if market["name"] != "Unavailable":
         market_columns[1].caption(
-            f"Nifty 50 close {market['close']:,.2f} vs. 50-day SMA {market['sma50']:,.2f} "
+            f"Nifty 50 close {market['close']:,.2f} vs. 200-day SMA {market['sma200']:,.2f} "
             f"on {market['date']}. Bull mode uses a 4× ATR target and 2.5× ATR breakeven trigger; "
-            "defensive mode uses 2× ATR and 1× ATR."
+            "defensive mode uses a 3× ATR target and 2× ATR breakeven trigger."
         )
     else:
         st.warning(f"Nifty 50 regime data is unavailable: {market['error']} BUY setups are paused until it loads.")
@@ -846,10 +850,11 @@ def main() -> None:
         st.markdown(
             "**Flexible score:** Indicator evidence is combined into a directional score from −100 to +100. +55 and above = Strong Buy; +20 to +54 = Buy; −19 to +19 = Hold; −20 to −54 = Sell; −55 and below = Strong Sell. A BUY action starts at score ≥+20; SELL starts at −20. RSI from 50–70 contributes bullish points, with RSI above 70 receiving a smaller boost through 75, or 80 when ADX >25. Ratings are weighted summaries, not probabilities. Missing optional P/E, Sharpe, or drawdown values are omitted and remaining weights are rescaled.\n\n"
             f"The score weighs price/SMA20, SMA20/SMA50, and SMA50/SMA200 (10 points each); MACD (12); RSI (10); high-volume candle, ADX, CMF, and Bollinger position (8 each); 1Y Sharpe and maximum drawdown (6 each); and available P/E (4).\n\n"
-            f"**Strict rules:** Requires Close > SMA20 > SMA50 > SMA200, MACD > signal, RSI from 50 to 75 (allowed up to 80 when ADX >25), volume ≥1.2× its 20-day average, ADX ≥{ADX_MINIMUM:.0f}, positive CMF, Bollinger %B ≤1.10, and the selected Sharpe/drawdown/P/E filters to pass. RSI need not cross 50 on the signal candle.\n\n"
-            f"**Market regime:** Nifty 50 above its 50-day SMA selects Bull mode (4 × ATR target; breakeven after +2.5 × ATR). At or below its 50-day SMA selects Defensive mode (2 × ATR target; breakeven after +1.0 × ATR). If the index data is unavailable, BUY setups are paused.\n\n"
+            f"**BUY entry gate:** Both signal modes require a weighted score of at least +20 and RSI strictly between 40 and 70. RSI does not need to cross 50 on the signal candle.\n\n"
+            f"**Strict rules:** Also requires Close > SMA20 > SMA50 > SMA200, MACD > signal, volume ≥1.2× its 20-day average, ADX ≥{ADX_MINIMUM:.0f}, positive CMF, Bollinger %B ≤1.10, and the selected Sharpe/drawdown/P/E filters to pass.\n\n"
+            f"**Market regime:** Nifty 50 above its 200-day SMA selects Bull mode (4 × ATR target; breakeven after +2.5 × ATR). At or below its 200-day SMA selects Defensive mode (3 × ATR target; breakeven after +2.0 × ATR). If index data is unavailable, BUY setups are paused.\n\n"
             "**Paper trade management:** A BUY queues a virtual entry at the next daily open. At entry, the initial stop is fixed at entry − 2 × the signal day's ATR. Target and breakeven trigger multiples are captured from the signal-day Nifty regime and stay fixed for that position, even if the regime later changes. If stop and target are both touched in one daily candle, the stop is assumed first; gaps through a stop are filled at the open. A SELL signal queues an exit for the next session open. This is a session-only paper log, not a brokerage position or an order.\n\n"
-            "In Strict rules mode, the score rating is extra context while Action follows the all-checks rule. **HOLD** means long-term trend and momentum are positive but some BUY checks fail. **SELL** is a review flag; in score mode it reflects a bearish indicator balance, while in strict mode it requires price < SMA50, MACD < signal, ADX ≥20, and CMF <0. Insufficient required data is reported as an error. The displayed 1Y Sharpe and drawdown are historical stock statistics, not a strategy backtest."
+            "In Strict rules mode, BUY requires both the common score/RSI entry gate and all strict indicator checks. **HOLD** means long-term trend and momentum are positive but one or more BUY checks fail. **SELL** is a review flag; in score mode it reflects a bearish indicator balance, while in strict mode it requires price < SMA50, MACD < signal, ADX ≥20, and CMF <0. Insufficient required data is reported as an error. The displayed 1Y Sharpe and drawdown are historical stock statistics, not a strategy backtest."
         )
         st.write("Indicators: SMA 20/50/200, Wilder RSI(14), MACD(12, 26, 9), ATR(14), Bollinger Bands(20, 2), ADX(14), CMF(20), 20-day average volume, trailing P/E, and one-year historical stock Sharpe/max drawdown.")
 
