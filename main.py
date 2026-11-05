@@ -407,6 +407,22 @@ def update_paper_positions(results: list[dict], signal_mode: str) -> None:
     positions = st.session_state.setdefault("paper_positions", {})
     closed_trades = st.session_state.setdefault("paper_trades", [])
 
+    # Preserve positions created by Update 2 when Streamlit keeps a session alive across deployment.
+    for saved_position in positions.values():
+        saved_position.setdefault("market_regime", "Update 2 legacy")
+        saved_position.setdefault("target_atr_multiple", BULL_TARGET_ATR)
+        saved_position.setdefault("breakeven_trigger_atr", BULL_BREAKEVEN_TRIGGER_ATR)
+        entry_atr = saved_position.get("entry_atr")
+        if entry_atr and saved_position.get("status") == "active":
+            if "target" in saved_position and "entry_price" in saved_position:
+                saved_position["target_atr_multiple"] = (
+                    saved_position["target"] - saved_position["entry_price"]
+                ) / entry_atr
+            if "breakeven_trigger" in saved_position and "entry_price" in saved_position:
+                saved_position["breakeven_trigger_atr"] = (
+                    saved_position["breakeven_trigger"] - saved_position["entry_price"]
+                ) / entry_atr
+
     for result in results:
         symbol = result["Symbol"]
         history = add_indicators(download_history(symbol))
