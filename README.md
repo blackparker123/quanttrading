@@ -1,6 +1,6 @@
 # QuantTrading
 
-A beginner-friendly Streamlit dashboard for preliminary Indian cash-equity swing research. It scans ten high-weight Nifty 50 constituents, downloads daily adjusted OHLCV data, calculates common trend/momentum/volume indicators, and shows a rule-based action with an explanation. It does not place orders.
+A beginner-friendly Streamlit dashboard for preliminary Indian cash-equity swing research. It scans ten high-weight Nifty 50 constituents, downloads daily adjusted OHLCV data, calculates common trend/momentum/volume indicators, and shows a flexible weighted rating or a stricter rule-based action with an explanation. It does not place orders.
 
 ## Project structure
 
@@ -50,7 +50,7 @@ You can also add symbols without changing code: in the dashboard's left sidebar,
 - **RSI (14):** Wilder-style relative strength index, a momentum measure from 0 to 100.
 - **MACD (12, 26, 9):** Difference between 12- and 26-session exponential averages plus its 9-session signal average.
 - **ATR (14):** Average true range, a measure of recent daily price movement.
-- **Bollinger Bands (20, 2):** The 20-day average plus/minus two standard deviations; BUY is blocked if the latest close is above the upper band.
+- **Bollinger Bands (20, 2):** The 20-day average plus/minus two standard deviations. The strict BUY rule permits a breakout through %B 1.10 and blocks a more extended move.
 - **ADX (14):** Trend strength; BUY and SELL require ADX of at least 20 so weak, directionless moves do not trigger those labels.
 - **CMF (20):** Chaikin Money Flow; BUY requires positive flow and SELL requires negative flow.
 - **Candlestick chart:** Daily OHLC candles with volume below; SMA and Bollinger overlays can be switched on/off to keep the chart readable.
@@ -58,12 +58,14 @@ You can also add symbols without changing code: in the dashboard's left sidebar,
 - **Trailing P/E:** Retrieved from Yahoo Finance when available. The sidebar's maximum P/E is a configurable BUY filter; set it to `0` to disable it. Missing P/E is shown as N/A and does not block a signal.
 - **1Y stock Sharpe and max drawdown:** Calculated from the stock's past year of daily buy-and-hold returns and used as configurable BUY filters. These describe the stock's history, not a portfolio or a backtest of this scanner's strategy.
 
-The preliminary rules are intentionally visible and editable in `evaluate()` in `main.py`:
+Choose **Flexible score** or **Strict rules** in the sidebar. Flexible score is the default. The preliminary logic is intentionally visible and editable in `evaluate()` and `weighted_score()` in `main.py`:
 
-- **BUY:** Close > SMA20 > SMA50 > SMA200, MACD above signal, RSI 50–70, volume ≥1.2× its 20-day average, ADX ≥20, positive CMF, close no higher than the upper Bollinger Band, and the selected Sharpe, drawdown, and P/E filters pass.
-- **HOLD:** Long-term trend and momentum are positive and CMF is not strongly negative, but one or more BUY checks fail.
-- **SELL:** Close < SMA50, MACD below signal, ADX ≥20, and CMF negative. This is a review flag, not an automatic sell order.
-- **NO ACTION:** The BUY and WATCH conditions are not met.
+- **Flexible score:** Indicator factors add bullish or bearish points to a score from −100 to +100. A score of +55 or more is **Strong Buy**, +20 to +54 is **Buy**, −19 to +19 is **Hold**, −20 to −54 is **Sell**, and −55 or lower is **Strong Sell**. The dashboard action becomes BUY at +20, SELL at −20, and HOLD in between. Scores are weighted summaries of indicator evidence, not probabilities.
+- Weights: price vs. SMA 20, SMA 20 vs. SMA 50, and SMA 50 vs. SMA 200 (10 points each); MACD (12); RSI (10); high-volume candle, ADX, CMF, and Bollinger position (8 each); 1Y Sharpe and maximum drawdown (6 each); and available trailing P/E (4 when its filter is enabled). The sidebar Sharpe and drawdown limits affect their score contributions. Missing optional P/E, Sharpe, or drawdown data is omitted and the remaining weights are rescaled.
+- RSI from 50–70 supports bullish momentum; RSI up to 75 is tolerated, extending to 80 when ADX > 25. Bollinger %B up to 1.10 is allowed to accommodate band-riding breakouts; above 1.10 weighs against a BUY.
+- **Strict rules:** Requires Close > SMA20 > SMA50 > SMA200, MACD above signal, RSI 50–75 (up to 80 when ADX > 25), volume ≥1.2× its 20-day average, ADX ≥20, positive CMF, Bollinger %B ≤1.10, and the selected Sharpe, drawdown, and P/E filters to pass. A score rating is still shown as context.
+
+- In Strict rules mode, **HOLD** means long-term trend and momentum are positive and CMF is not strongly negative, but one or more BUY checks fail. **SELL** requires Close < SMA50, MACD below signal, ADX ≥20, and CMF negative. Otherwise, the result is **NO ACTION**. A SELL is a review flag, not an automatic sell order.
 
 The sidebar lets you set a maximum P/E (0 disables the filter), a minimum one-year Sharpe, and a maximum historical drawdown for BUY setups. The summary table shows risk percentage, reward percentage, and reward/risk ratio for every stock, regardless of its action.
 
@@ -74,4 +76,3 @@ For BUY, HOLD, and NO ACTION, the table shows an illustrative long-side scenario
 The app asks yfinance for two years of daily adjusted OHLCV data, enough history for the 200-day average. Data is cached for 15 minutes; use **Refresh market data** to clear the cache. A network failure, rate limit, missing symbol, or short history is shown in the dashboard instead of stopping the whole scan.
 
 This is a technical screening example for research and education. It has not been backtested or validated as a profitable strategy, does not consider fundamentals or your financial circumstances, and is not personalized financial advice. It cannot know your holdings, entry price, capital, risk tolerance, or tax situation. Review the chart, data date, and rules yourself; the dashboard never connects to a broker or places trades.
-

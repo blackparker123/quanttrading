@@ -154,8 +154,43 @@ def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def evaluate(symbol: str, company: str, max_pe: float, min_sharpe: float, max_drawdown_pct: float) -> dict:
-    """Apply fixed, visible rules and calculate illustrative ATR-based levels."""
+def weighted_score(factors: list[tuple[str, int, float]]) -> tuple[int, str, str]:
+    """Return a directional score (-100 to +100), rating, and readable drivers."""
+    available_weight = sum(weight for _, weight, _ in factors)
+    if not available_weight:
+        return 0, "Hold", "No score inputs were available."
+
+    score = round(100 * sum(weight * direction for _, weight, direction in factors) / available_weight)
+    if score >= 55:
+        rating = "Strong Buy"
+    elif score >= 20:
+        rating = "Buy"
+    elif score > -20:
+        rating = "Hold"
+    elif score > -55:
+        rating = "Sell"
+    else:
+        rating = "Strong Sell"
+
+    active = [(name, round(weight * direction)) for name, weight, direction in factors if direction]
+    active.sort(key=lambda item: abs(item[1]), reverse=True)
+    if active:
+        drivers = "; ".join(f"{name} ({points:+d})" for name, points in active[:5])
+        reason = f"Weighted score {score:+d}/100. Main score drivers: {drivers}."
+    else:
+        reason = f"Weighted score {score:+d}/100; the available indicators are mostly neutral."
+    return score, rating, reason
+
+
+def evaluate(
+    symbol: str,
+    company: str,
+    max_pe: float,
+    min_sharpe: float,
+    max_drawdown_pct: float,
+    signal_mode: str,
+) -> dict:
+    """Score indicators or apply the visible rules, then calculate ATR-based levels."""
     history = add_indicators(download_history(symbol))
     last = history.iloc[-1]
     fields = ["Close", "SMA20", "SMA50", "SMA200", "RSI", "MACD", "MACD Signal", "ATR", "Volume", "Volume Avg", "ADX", "CMF", "BB Upper"]
@@ -163,6 +198,7 @@ def evaluate(symbol: str, company: str, max_pe: float, min_sharpe: float, max_dr
         raise ValueError("Not enough clean daily history to calculate all indicators and risk levels.")
 
     price = float(last["Close"])
+    open_price = float(last["Open"])
     sma20, sma50, sma200 = (float(last[name]) for name in ("SMA20", "SMA50", "SMA200"))
     rsi = float(last["RSI"])
     macd, macd_signal = float(last["MACD"]), float(last["MACD Signal"])
@@ -179,22 +215,64 @@ def evaluate(symbol: str, company: str, max_pe: float, min_sharpe: float, max_dr
     sharpe_ok = sharpe_1y is None or sharpe_1y >= min_sharpe
     drawdown_ok = max_dd_1y_pct is None or max_dd_1y_pct >= -max_drawdown_pct
 
+    rsi_buy_ceiling = 80 if adx > 25 else 75
     buy_checks = {
         "Price above 20-day average": price > sma20,
         "20-day average above 50-day": sma20 > sma50,
         "50-day average above 200-day": sma50 > sma200,
         "MACD above signal": macd > macd_signal,
-        "RSI between 50 and 70": 50 <= rsi <= 70,
+        f"RSI between 50 and {rsi_buy_ceiling}": 50 <= rsi <= rsi_buy_ceiling,
         f"Volume at least {BUY_VOLUME_MULTIPLE:.1f}× its 20-day average": volume_ratio >= BUY_VOLUME_MULTIPLE,
         f"ADX confirms trend (≥ {ADX_MINIMUM:.0f})": adx >= ADX_MINIMUM,
         "CMF confirms positive volume flow": cmf > 0,
-        "Close is not above the upper Bollinger Band": price <= float(last["BB Upper"]),
+        "Bollinger %B is no higher than 1.10": pd.notna(bb_percent_b) and bb_percent_b <= 1.10,
         f"1Y Sharpe meets minimum ({min_sharpe:.1f})": sharpe_ok,
         f"1Y max drawdown is within {max_drawdown_pct:.0f}%": drawdown_ok,
         f"Trailing P/E is positive and ≤ {max_pe:.0f}, when available": pe_ok,
     }
     watch_ok = price > sma50 > sma200 and macd > macd_signal and 40 <= rsi <= 75 and cmf > -0.05
-    if all(buy_checks.values()):
+    factors: list[tuple[str, int, float]] = [
+        ("Price vs SMA 20", 10, 1.0 if price > sma20 else -1.0),
+        ("SMA 20 vs SMA 50", 10, 1.0 if sma20 > sma50 else -1.0),
+        ("SMA 50 vs SMA 200", 10, 1.0 if sma50 > sma200 else -1.0),
+        ("MACD vs signal", 12, 1.0 if macd > macd_signal else -1.0),
+    ]
+    if 50 <= rsi <= 70:
+        rsi_signal = 1.0
+    elif 70 < rsi <= rsi_buy_ceiling:
+        rsi_signal = 0.6
+    elif 45 <= rsi < 50:
+        rsi_signal = -0.2
+    elif 35 <= rsi < 45:
+        rsi_signal = -0.6
+    else:
+        rsi_signal = -1.0
+    factors.append(("RSI", 10, rsi_signal))
+    factors.append(("High-volume candle", 8, (1.0 if price >= open_price else -1.0) if volume_ratio >= BUY_VOLUME_MULTIPLE else 0.0))
+    adx_signal = (1.0 if price > sma50 else -1.0) if adx >= 25 else ((0.5 if price > sma50 else -0.5) if adx >= ADX_MINIMUM else 0.0)
+    factors.append(("ADX trend strength", 8, adx_signal))
+    cmf_signal = 1.0 if cmf > 0.05 else (0.5 if cmf > 0 else (-1.0 if cmf < -0.05 else (-0.5 if cmf < 0 else 0.0)))
+    factors.append(("CMF money flow", 8, cmf_signal))
+    if pd.notna(bb_percent_b):
+        bb_signal = -1.0 if bb_percent_b > 1.10 else (0.5 if 0.7 <= bb_percent_b <= 1.10 else (0.0 if 0.3 <= bb_percent_b < 0.7 else (-0.5 if bb_percent_b <= 0.1 else -0.2)))
+        factors.append(("Bollinger position", 8, bb_signal))
+    if sharpe_1y is not None:
+        sharpe_signal = 1.0 if sharpe_1y >= min_sharpe + 0.5 else (0.5 if sharpe_1y >= min_sharpe else -1.0)
+        factors.append(("1Y Sharpe", 6, sharpe_signal))
+    if max_dd_1y_pct is not None:
+        drawdown_limit = -max_drawdown_pct
+        drawdown_signal = 1.0 if max_dd_1y_pct >= drawdown_limit + 15 else (0.5 if max_dd_1y_pct >= drawdown_limit else -1.0)
+        factors.append(("1Y maximum drawdown", 6, drawdown_signal))
+    if max_pe > 0 and pe is not None:
+        pe_signal = -1.0 if pe <= 0 else (0.5 if pe <= max_pe else -0.5)
+        factors.append(("Trailing P/E filter", 4, pe_signal))
+    score, rating, score_reason = weighted_score(factors)
+
+    if signal_mode == "Flexible score":
+        action = "BUY" if score >= 20 else ("SELL" if score <= -20 else "HOLD")
+        reason = score_reason + " BUY starts at +20; SELL starts at -20."
+        stop = target = None
+    elif all(buy_checks.values()):
         action = "BUY"
         reason = "Trend, momentum, volatility, volume-flow, valuation, and historical-risk filters all pass."
         stop = price - ATR_STOP_MULTIPLE * atr
@@ -237,7 +315,8 @@ def evaluate(symbol: str, company: str, max_pe: float, min_sharpe: float, max_dr
     reward_pct = (abs(target - price) / price * 100) if target is not None else None
     date = pd.Timestamp(history.index[-1]).strftime("%d %b %Y")
     return {
-        "Symbol": symbol, "Company": company, "Date": date, "Action": action, "Scenario": scenario, "Reason": reason,
+        "Symbol": symbol, "Company": company, "Date": date, "Action": action, "Rating": rating,
+        "Score": score, "Scenario": scenario, "Reason": reason,
         "Price": price, "Stop loss": stop, "Target": target, "Risk %": risk_pct,
         "Reward %": reward_pct, "RSI (14)": rsi, "Trend": "Bullish" if price > sma50 > sma200 else "Mixed / weak",
         "Volume vs avg": volume_ratio, "SMA20": sma20, "SMA50": sma50, "SMA200": sma200,
@@ -334,12 +413,17 @@ def main() -> None:
     st.title("📈 QuantTrading")
     st.caption("Indian cash-equity swing research · Daily data · No order placement")
     st.info(
-        "Signals are rule-based research outputs from recent market data, not personalized financial advice. "
+        "Signals are indicator-based research outputs from recent market data, not personalized financial advice. "
         "Check the reason, data date, and your own risk limits before making any decision."
     )
 
     with st.sidebar:
         st.header("Scanner")
+        signal_mode = st.selectbox(
+            "Signal mode",
+            ("Flexible score", "Strict rules"),
+            help="Flexible score combines bullish and bearish indicator evidence. Strict rules keeps the all-checks-must-pass BUY logic.",
+        )
         st.write("Top Nifty 50 constituents by index weight, plus any symbols you add below.")
         with st.form("custom_watchlist"):
             added_symbols = st.text_input(
@@ -367,7 +451,7 @@ def main() -> None:
     with st.spinner("Loading daily prices and calculating indicators…"):
         for symbol, company in watchlist.items():
             try:
-                results.append(evaluate(symbol, company, max_pe, min_sharpe, float(max_drawdown_pct)))
+                results.append(evaluate(symbol, company, max_pe, min_sharpe, float(max_drawdown_pct), signal_mode))
             except Exception as exc:
                 errors.append({"Symbol": symbol, "Company": company, "Error": str(exc)[:180]})
 
@@ -387,8 +471,9 @@ def main() -> None:
         col.metric(label, value)
 
     st.subheader("Market scan")
-    st.caption("One clear row per stock. Select a row to inspect its chart, risk levels, and rule explanation.")
-    display = frame[["Company", "Symbol", "Date", "Action", "Scenario", "Price", "Stop loss", "Target", "Reward/Risk", "Risk %", "Reward %", "P/E"]].copy()
+    st.caption("One clear row per stock. The rating and score summarize indicator evidence; select a row for details.")
+    display = frame[["Company", "Symbol", "Date", "Action", "Rating", "Score", "Price", "Stop loss", "Target", "Reward/Risk", "Risk %", "Reward %"]].copy()
+    display["Score"] = display["Score"].map(lambda value: f"{value:+d}")
     display["Price"] = display["Price"].map(money)
     for column in ("Stop loss", "Target"):
         display[column] = display[column].map(money)
@@ -403,7 +488,10 @@ def main() -> None:
     left, right = st.columns([1, 1.4], gap="large")
     with left:
         st.subheader(f"{selected['Company']} · {selected['Symbol']}")
-        st.metric("Rule-based action", selected["Action"])
+        st.metric("Flexible score action" if signal_mode == "Flexible score" else "Strict rules action", selected["Action"])
+        score_cols = st.columns(2)
+        score_cols[0].metric("Score rating", selected["Rating"])
+        score_cols[1].metric("Directional score", f"{selected['Score']:+d}/100")
         st.write(f"**Latest daily candle:** {selected['Date']} · **Close:** {money(selected['Price'])}")
         st.write(f"**Why:** {selected['Reason']}")
         if selected["Action"] == "BUY":
@@ -442,10 +530,10 @@ def main() -> None:
 
     with st.expander("How the actions and risk levels are calculated"):
         st.markdown(
-            f"**BUY:** Close > SMA20 > SMA50 > SMA200, MACD > signal, RSI 50–70, volume ≥ 1.2× its 20-day average, ADX ≥ {ADX_MINIMUM:.0f}, positive CMF, close no higher than the upper Bollinger Band, and the selected Sharpe/drawdown/P/E BUY filters pass.\n\n"
-            "**HOLD:** Long-term trend and momentum are positive and CMF is not strongly negative, but one or more BUY checks fail.\n\n"
-            f"**SELL:** Price < SMA50, MACD < signal, ADX ≥ {ADX_MINIMUM:.0f}, and CMF < 0. This is a review flag, not an order. The SELL stop/target use a hypothetical short-side scenario.\n\n"
-            "**NO ACTION:** Neither BUY nor WATCH is supported by these rules. Missing or insufficient data is reported as an error.\n\n"
+            "**Flexible score:** Indicator evidence is combined into a directional score from −100 to +100. +55 and above = Strong Buy; +20 to +54 = Buy; −19 to +19 = Hold; −20 to −54 = Sell; −55 and below = Strong Sell. The dashboard action is BUY at +20, SELL at −20, and HOLD in between. Scores are weighted indicator summaries, not probabilities. Missing optional P/E, Sharpe, or drawdown values are omitted and the remaining available weights are rescaled.\n\n"
+            f"The score weighs price/SMA20, SMA20/SMA50, and SMA50/SMA200 (10 points each); MACD (12); RSI (10); high-volume candle, ADX, CMF, and Bollinger position (8 each); and 1Y Sharpe and maximum drawdown (6 each). Available trailing P/E contributes 4 points when the P/E filter is enabled. The sidebar Sharpe and drawdown limits also affect their score contributions. RSI 70–75 is tolerated, and up to 80 when ADX > 25; Bollinger breakouts are tolerated through %B 1.10.\n\n"
+            f"**Strict rules:** Requires Close > SMA20 > SMA50 > SMA200, MACD > signal, RSI 50–75 (up to 80 when ADX > 25), volume ≥ 1.2× its 20-day average, ADX ≥ {ADX_MINIMUM:.0f}, positive CMF, Bollinger %B ≤ 1.10, and the selected Sharpe/drawdown/P/E filters to pass.\n\n"
+            "In Strict rules mode, the score rating is shown as extra context while Action follows the all-checks rule. **HOLD** means long-term trend and momentum are positive but some BUY checks fail. **SELL** is a review flag, not an order; in score mode it reflects a bearish indicator balance, while in strict mode it requires price < SMA50, MACD < signal, ADX ≥ 20, and CMF < 0. Insufficient required data is reported as an error.\n\n"
             "All stocks show an ATR-based scenario: BUY, HOLD, and NO ACTION use a long-side illustration (stop = close − 2 × ATR; target = close + 2 times the stop distance); SELL uses a hypothetical short-side illustration (stop = close + 2 × ATR; target = close − 2 times the stop distance). "
             "All levels use the latest close, not a user's actual entry price. The displayed 1Y Sharpe and drawdown describe the stock's historical buy-and-hold returns; they are not a portfolio or strategy backtest."
         )
@@ -459,4 +547,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
