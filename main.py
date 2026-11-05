@@ -480,7 +480,6 @@ def main() -> None:
     for column in ("Risk %", "Reward %"):
         display[column] = display[column].map(lambda value: "—" if pd.isna(value) else f"{value:.1f}%")
     display["Reward/Risk"] = display["Reward/Risk"].map(lambda value: "—" if pd.isna(value) else f"{value:.1f}:1")
-    display["P/E"] = display["P/E"].map(lambda value: "N/A" if pd.isna(value) else f"{value:.1f}×")
     st.dataframe(display, hide_index=True, width="stretch", height=min(560, 42 + 40 * len(display)))
 
     chosen = st.selectbox("Stock details", frame["Company"].tolist(), label_visibility="collapsed")
