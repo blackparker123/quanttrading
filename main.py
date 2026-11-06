@@ -949,10 +949,9 @@ def main() -> None:
                     current_price = float(selected["Price"])
                     active_stop = average_entry if already_scaled else holding_stop
                     st.write(f"**Entry-date regime:** {ownership_regime} · **ATR used:** {money(entry_atr)} from {signal_date.strftime('%d %b %Y')}")
-                    level_cols = st.columns(3)
-                    level_cols[0].metric("Current plan stop", money(active_stop))
-                    level_cols[1].metric("Sell 50% level", "Already done" if already_scaled else money(scale_price))
-                    level_cols[2].metric("Final target", money(holding_target))
+                    st.metric("Current plan stop", money(active_stop))
+                    st.metric("Sell 50% level", "Already done" if already_scaled else money(scale_price))
+                    st.metric("Final target", money(holding_target))
                     if current_price <= active_stop:
                         st.error("The estimated stop level has been reached or crossed. Under this plan, exit the remaining holding.")
                     elif current_price >= holding_target:
