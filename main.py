@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
+from urllib.request import urlopen
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
+from nifty100_engine import scan_nifty100
 
 
 # Edit this list to scan other Yahoo Finance symbols. NSE symbols end in .NS.
@@ -24,6 +27,11 @@ WATCHLIST = {
     "KOTAKBANK.NS": "Kotak Mahindra Bank",
     "ITC.NS": "ITC",
 }
+
+# Main mode is Nifty 100. To restore the original scanner, change this to
+# "WATCHLIST"; the existing WATCHLIST dictionary and scanning path are retained.
+SCAN_UNIVERSE = "NIFTY100"  # Allowed values: "NIFTY100" or "WATCHLIST"
+SCHEDULED_SCAN_URL = "https://raw.githubusercontent.com/blackparker123/quanttrading/daily-scan/daily_scan.json"
 
 HISTORY_PERIOD = "2y"  # Gives enough daily candles for the 200-day average.
 NIFTY_INDEX_SYMBOL = "^NSEI"
@@ -119,6 +127,22 @@ def download_nifty_close() -> pd.Series:
     if close.empty:
         raise ValueError("Nifty 50 index closes are unavailable.")
     return close
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def download_scheduled_nifty100_scan() -> dict:
+    """Read the latest background scan from the public data-only Git branch."""
+    with urlopen(SCHEDULED_SCAN_URL, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        raise ValueError("The scheduled Nifty 100 scan file is not valid.")
+    return payload
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def scan_nifty100_cached() -> dict:
+    """Run the Nifty 100 engine live when a current scheduled scan is unavailable."""
+    return scan_nifty100(download_nifty_close())
 
 
 def get_market_regime() -> dict:
@@ -734,28 +758,38 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Scanner")
-        signal_mode = st.selectbox(
-            "Signal mode",
-            ("Flexible score", "Strict rules"),
-            help="Flexible score combines bullish and bearish indicator evidence. Strict rules keeps the all-checks-must-pass BUY logic.",
-        )
-        st.write("Top Nifty 50 constituents by index weight, plus any symbols you add below.")
+        if SCAN_UNIVERSE == "NIFTY100":
+            signal_mode = "Flexible score"
+            st.caption("The Nifty 100 leaderboard always ranks by the Flexible Directional Score.")
+            st.write("Main scanner: Nifty 100 Top 10 leaderboard. To return to the original 10-stock list, change `SCAN_UNIVERSE` near the top of `main.py` to `WATCHLIST`.")
+            max_pe, min_sharpe, max_drawdown_pct = 60.0, 0.0, 50
+            st.caption("Score settings in this mode: maximum P/E 60, minimum 1Y Sharpe 0, maximum historical drawdown 50%.")
+        else:
+            signal_mode = st.selectbox(
+                "Signal mode",
+                ("Flexible score", "Strict rules"),
+                help="Flexible score combines bullish and bearish indicator evidence. Strict rules keeps the all-checks-must-pass BUY logic.",
+            )
+            st.write("Original 10-stock scanner mode is active.")
+            max_pe = st.number_input("Maximum trailing P/E (0 disables)", min_value=0.0, max_value=300.0, value=60.0, step=5.0)
+            min_sharpe = st.number_input("Minimum 1Y Sharpe", min_value=-2.0, max_value=3.0, value=0.0, step=0.1)
+            max_drawdown_pct = st.slider("Maximum historical drawdown", min_value=10, max_value=80, value=50)
         with st.form("custom_watchlist"):
             added_symbols = st.text_input(
                 "Add your own Yahoo Finance symbols",
                 placeholder="WIPRO.NS, TATAMOTORS.NS",
-                help="Enter one or more symbols separated by commas. For NSE shares, Yahoo symbols usually end in .NS.",
+                help="Enter one or more symbols separated by commas. For NSE shares, Yahoo symbols usually end in .NS. Custom symbols are included in WATCHLIST rollback mode.",
             )
             st.form_submit_button("Apply symbols")
         if st.button("Refresh market data", type="primary", width="stretch"):
             download_history.clear()
             download_nifty_close.clear()
+            download_scheduled_nifty100_scan.clear()
+            scan_nifty100_cached.clear()
             st.rerun()
         st.caption("Cached for 15 minutes. Yahoo Finance may return delayed, missing, or unavailable data.")
-        st.subheader("BUY filters")
-        max_pe = st.number_input("Maximum trailing P/E (0 disables)", min_value=0.0, max_value=300.0, value=60.0, step=5.0)
-        min_sharpe = st.number_input("Minimum 1Y Sharpe", min_value=-2.0, max_value=3.0, value=0.0, step=0.1)
-        max_drawdown_pct = st.slider("Maximum historical drawdown", min_value=10, max_value=80, value=50)
+        if SCAN_UNIVERSE != "NIFTY100":
+            st.subheader("BUY filters")
 
     market = get_market_regime()
     market_columns = st.columns([1, 2])
@@ -770,47 +804,94 @@ def main() -> None:
     else:
         st.warning(f"Nifty 50 regime data is unavailable: {market['error']} BUY setups are paused until it loads.")
 
-    watchlist = dict(WATCHLIST)
-    for raw_symbol in added_symbols.split(","):
-        symbol = raw_symbol.strip().upper()
-        if symbol:
-            watchlist.setdefault(symbol, symbol)
-
-    results, errors = [], []
-    with st.spinner("Loading daily prices and calculating indicators…"):
-        for symbol, company in watchlist.items():
+    leaderboard_mode = SCAN_UNIVERSE == "NIFTY100"
+    scan_payload = None
+    if leaderboard_mode:
+        market_date = pd.to_datetime(market["date"]).strftime("%Y-%m-%d") if market.get("date") else None
+        with st.spinner("Loading the latest Nifty 100 background scan…"):
             try:
-                results.append(evaluate(symbol, company, max_pe, min_sharpe, float(max_drawdown_pct), signal_mode, market["name"]))
-            except Exception as exc:
-                errors.append({"Symbol": symbol, "Company": company, "Error": str(exc)[:180]})
+                scheduled = download_scheduled_nifty100_scan()
+            except Exception:
+                scheduled = None
+            if scheduled and scheduled.get("as_of") == market_date:
+                scan_payload = scheduled
+            else:
+                if scheduled and market_date and scheduled.get("as_of") != market_date:
+                    st.caption("The scheduled leaderboard is from an earlier market close; refreshing the Nifty 100 scan now.")
+                try:
+                    scan_payload = scan_nifty100_cached()
+                except Exception as exc:
+                    scan_payload = {"results": [], "errors": [], "message": str(exc)[:220]}
+        results = scan_payload.get("results", [])[:10]
+        errors = scan_payload.get("errors", [])
+    else:
+        watchlist = dict(WATCHLIST)
+        for raw_symbol in added_symbols.split(","):
+            symbol = raw_symbol.strip().upper()
+            if symbol:
+                watchlist.setdefault(symbol, symbol)
+
+        results, errors = [], []
+        with st.spinner("Loading daily prices and calculating indicators…"):
+            for symbol, company in watchlist.items():
+                try:
+                    results.append(evaluate(symbol, company, max_pe, min_sharpe, float(max_drawdown_pct), signal_mode, market["name"]))
+                except Exception as exc:
+                    errors.append({"Symbol": symbol, "Company": company, "Error": str(exc)[:180]})
 
     if not results:
-        st.error("No symbols could be scanned. Check your internet connection or try again later.")
+        if leaderboard_mode:
+            st.info(scan_payload.get("message") or "No Nifty 100 stocks passed the alignment, RSI, and 200-day SMA filters today.")
+            if scan_payload.get("as_of"):
+                st.caption(f"Background or live scan date: {scan_payload['as_of']} · Nifty 100 constituents: {scan_payload.get('constituents', '—')}.")
+        else:
+            st.error("No symbols could be scanned. Check your internet connection or try again later.")
         if errors:
             st.dataframe(pd.DataFrame(errors), hide_index=True, width="stretch")
         return
 
-    update_paper_positions(results, signal_mode)
+    if not leaderboard_mode:
+        update_paper_positions(results, signal_mode)
     frame = pd.DataFrame(results)
     buys = int((frame["Action"] == "BUY").sum())
     exits = int(frame["Action"].str.startswith("SELL").sum())
     holds = int((frame["Action"] == "HOLD").sum())
     no_action = len(frame) - buys - exits - holds
-    metric_cols = st.columns(4)
-    for col, label, value in zip(metric_cols, ("BUY setups", "HOLD", "SELL review", "NO ACTION"), (buys, holds, exits, no_action)):
-        col.metric(label, value)
+    if leaderboard_mode:
+        metric_cols = st.columns(3)
+        metric_cols[0].metric("Stocks passing filters", scan_payload.get("eligible_count", len(results)))
+        metric_cols[1].metric("Top 10 shown", len(results))
+        metric_cols[2].metric("Nifty 50 alignment", scan_payload.get("market_regime", market["name"]))
+        st.subheader("Nifty 100 · Top 10 by Directional Score")
+        st.caption(
+            f"As of {scan_payload.get('as_of', 'unknown')}. Candidates pass the Nifty 50 Bull-regime, stock-above-SMA-200, "
+            "and RSI 40–70 filters. The next session's opening price is unknown until the market opens; starred levels are provisional from the latest close."
+        )
+        display = frame[["Company", "Symbol", "Action", "Rating", "Score", "RSI (14)", "Price", "Entry plan", "Stop loss", "Scale-out level", "Target"]].copy()
+        display.insert(0, "Rank", range(1, len(display) + 1))
+        display.rename(columns={"Price": "Close ref", "Stop loss": "2×ATR stop*", "Scale-out level": "Sell 50%*", "Target": "Final target*"}, inplace=True)
+        display["Score"] = display["Score"].map(lambda value: f"{value:+d}/100")
+        display["RSI (14)"] = display["RSI (14)"].map(lambda value: f"{value:.1f}")
+        for column in ("Close ref", "2×ATR stop*", "Sell 50%*", "Final target*"):
+            display[column] = display[column].map(money)
+        st.dataframe(display, hide_index=True, width="stretch", height=min(520, 46 + 42 * len(display)))
+        st.caption("* Stop, half-off, and target prices use the latest close as a planning reference. They re-anchor to the actual next-open fill; no orders are placed.")
+    else:
+        metric_cols = st.columns(4)
+        for col, label, value in zip(metric_cols, ("BUY setups", "HOLD", "SELL review", "NO ACTION"), (buys, holds, exits, no_action)):
+            col.metric(label, value)
 
-    st.subheader("Market scan")
-    st.caption("One clear row per stock. The rating and score summarize indicator evidence. Stop/target are anchored for active paper positions; otherwise they are illustrative.")
-    display = frame[["Company", "Symbol", "Date", "Action", "Rating", "Score", "Price", "Stop loss", "Target", "Reward/Risk", "Risk %", "Reward %"]].copy()
-    display["Score"] = display["Score"].map(lambda value: f"{value:+d}")
-    display["Price"] = display["Price"].map(money)
-    for column in ("Stop loss", "Target"):
-        display[column] = display[column].map(money)
-    for column in ("Risk %", "Reward %"):
-        display[column] = display[column].map(lambda value: "—" if pd.isna(value) else f"{value:.1f}%")
-    display["Reward/Risk"] = display["Reward/Risk"].map(lambda value: "—" if pd.isna(value) else f"{value:.1f}:1")
-    st.dataframe(display, hide_index=True, width="stretch", height=min(560, 42 + 40 * len(display)))
+        st.subheader("Market scan")
+        st.caption("One clear row per stock. The rating and score summarize indicator evidence. Stop/target are anchored for active paper positions; otherwise they are illustrative.")
+        display = frame[["Company", "Symbol", "Date", "Action", "Rating", "Score", "Price", "Stop loss", "Target", "Reward/Risk", "Risk %", "Reward %"]].copy()
+        display["Score"] = display["Score"].map(lambda value: f"{value:+d}")
+        display["Price"] = display["Price"].map(money)
+        for column in ("Stop loss", "Target"):
+            display[column] = display[column].map(money)
+        for column in ("Risk %", "Reward %"):
+            display[column] = display[column].map(lambda value: "—" if pd.isna(value) else f"{value:.1f}%")
+        display["Reward/Risk"] = display["Reward/Risk"].map(lambda value: "—" if pd.isna(value) else f"{value:.1f}:1")
+        st.dataframe(display, hide_index=True, width="stretch", height=min(560, 42 + 40 * len(display)))
 
     chosen = st.selectbox("Stock details", frame["Company"].tolist(), label_visibility="collapsed")
     selected = frame.loc[frame["Company"] == chosen].iloc[0]
@@ -818,15 +899,23 @@ def main() -> None:
     left, right = st.columns([1, 1.4], gap="large")
     with left:
         st.subheader(f"{selected['Company']} · {selected['Symbol']}")
-        st.metric("Flexible score action" if signal_mode == "Flexible score" else "Strict rules action", selected["Action"])
+        st.metric("Leaderboard status" if leaderboard_mode else ("Flexible score action" if signal_mode == "Flexible score" else "Strict rules action"), selected["Action"])
         score_cols = st.columns(2)
         score_cols[0].metric("Score rating", selected["Rating"])
         score_cols[1].metric("Directional score", f"{selected['Score']:+d}/100")
         st.write(f"**Latest daily candle:** {selected['Date']} · **Close:** {money(selected['Price'])}")
         st.write(f"**Current market regime:** {selected['Market regime']}")
         st.write(f"**Why:** {selected['Reason']}")
-        st.write(f"**Paper tracking:** {selected['Paper status']}")
-        if selected["Paper status"].startswith("Active") or selected["Paper status"].startswith("Exit queued"):
+        st.write(f"**Scanner:** {selected['Paper status']}" if leaderboard_mode else f"**Paper tracking:** {selected['Paper status']}")
+        if leaderboard_mode:
+            st.info(
+                f"Next-open entry: not known until the market opens. Latest close reference: {money(selected['Price'])}. "
+                "The following levels are provisional and will need to be recalculated from the actual opening fill."
+            )
+            st.metric("Provisional 2×ATR stop", money(selected["Stop loss"]))
+            st.metric("Provisional sell-50% level", money(selected["Scale-out level"]))
+            st.metric("Provisional final target", money(selected["Target"]))
+        elif selected["Paper status"].startswith("Active") or selected["Paper status"].startswith("Exit queued"):
             st.write(f"**Paper entry:** {money(selected['Paper entry'])} · **Current stop:** {money(selected['Stop loss'])} · **Fixed target:** {money(selected['Target'])}")
             position = st.session_state.get("paper_positions", {}).get(selected["Symbol"], {})
             if position.get("management_version", 4) >= 5:
@@ -1047,6 +1136,7 @@ def main() -> None:
 
     with st.expander("How the actions and risk levels are calculated"):
         st.markdown(
+            "**Nifty 100 leaderboard:** The main mode uses the current NSE Nifty 100 roster, removes candidates unless Nifty 50 is above its 200-day SMA, the stock is above its own SMA 200, and RSI is 40–70, then sorts by Directional Score. The score uses the same technical and available valuation/history factors as Flexible score. Entry is next open (unknown until then); displayed risk levels use today's close as a reference. Change `SCAN_UNIVERSE` to `WATCHLIST` to restore the previous 10-stock scanner.\n\n"
             "**Flexible score:** Indicator evidence is combined into a directional score from −100 to +100. +55 and above = Strong Buy; +20 to +54 = Buy; −19 to +19 = Hold; −20 to −54 = Sell; −55 and below = Strong Sell. A BUY action starts at score ≥+20; SELL starts at −20. RSI from 50–70 contributes bullish points, with RSI above 70 receiving a smaller boost through 75, or 80 when ADX >25. Ratings are weighted summaries, not probabilities. Missing optional P/E, Sharpe, or drawdown values are omitted and remaining weights are rescaled.\n\n"
             f"The score weighs price/SMA20, SMA20/SMA50, and SMA50/SMA200 (10 points each); MACD (12); RSI (10); high-volume candle, ADX, CMF, and Bollinger position (8 each); 1Y Sharpe and maximum drawdown (6 each); and available P/E (4).\n\n"
             f"**BUY entry gate:** Both signal modes require a weighted score of at least +20 and RSI strictly between 40 and 70. RSI does not need to cross 50 on the signal candle.\n\n"

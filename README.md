@@ -1,12 +1,15 @@
 # QuantTrading
 
-A beginner-friendly Streamlit dashboard for preliminary Indian cash-equity swing research. It scans ten high-weight Nifty 50 constituents, downloads daily adjusted OHLCV data, calculates common trend/momentum/volume indicators, and shows a flexible weighted rating or a stricter rule-based action with an explanation. It does not place orders.
+A beginner-friendly Streamlit dashboard for preliminary Indian cash-equity swing research. The main mode scans the current Nifty 100, filters stocks by market alignment, RSI, and their 200-day average, then ranks the top ten by the existing Directional Score. The original ten-stock scanner remains available by changing one code setting. It does not place orders.
 
 ## Project structure
 
 ```text
 QuantTrading/
 ├── main.py           # Dashboard, downloads, indicators, rules, and risk levels
+├── nifty100_engine.py # Nifty 100 constituent download, batch scan, and ranking
+├── daily_scan.py     # One-shot runner for the nightly background scan
+├── .github/workflows/nifty100-evening-scan.yml # Weekday after-close schedule
 ├── requirements.txt  # Python packages to install, including Plotly charts
 ├── README.md         # Setup, usage, and rule explanations
 └── .gitignore        # Keeps virtual environments and local secrets out of Git
@@ -38,11 +41,35 @@ Streamlit opens the dashboard in your browser. In VS Code, stop it with **Ctrl+C
 
 On macOS/Linux, use `python3 -m venv .venv`, `source .venv/bin/activate`, `python -m pip install -r requirements.txt`, and `python -m streamlit run main.py`.
 
-## Watchlist
+## Main scanner: Nifty 100 leaderboard
 
-The starter watchlist is the ten largest Nifty 50 constituents by weight according to the May 29, 2026 Nifty Indices factsheet. Index membership and weights change; edit the `WATCHLIST` dictionary near the top of `main.py` when you want a different set. NSE Yahoo Finance symbols use the `.NS` suffix.
+The main mode reads the current constituent list from the [official NSE Nifty 100 page](https://www.nseindia.com/static/products-services/indices-nifty100-index), downloads adjusted daily OHLCV in batches, and ranks eligible stocks by the existing Directional Score. A stock is eligible only when Nifty 50 is above its 200-day SMA, the stock closes above its own 200-day SMA, and RSI is between 40 and 70. The dashboard shows up to the ten highest-scoring eligible stocks.
 
-You can also add symbols without changing code: in the dashboard's left sidebar, enter comma-separated Yahoo Finance symbols in **Add your own Yahoo Finance symbols**, for example `WIPRO.NS, TATAMOTORS.NS`. They are included in the scan while entered. If Yahoo Finance does not recognize a symbol, that row appears under **Data issues**.
+The GitHub Actions workflow runs on weekdays at 16:30 India Standard Time and publishes the latest JSON result on a separate `daily-scan` branch. When that day's scan is not available, the dashboard runs the scan live instead. GitHub-hosted scheduled jobs can start late, and market holidays may produce no new candle; the date shown with the leaderboard identifies the data it used. The workflow can also be started manually from the repository's **Actions** tab.
+
+The next session's opening price is not knowable after today's close. The dashboard therefore labels the entry as **Next open · TBD** and estimates the 2 × ATR stop, 50% scale-out, and final target from today's close. After an actual entry, recalculate those levels from the real opening fill. The app does not submit orders.
+
+### Roll back to the original scanner
+
+Near the top of `main.py`, change:
+
+```python
+SCAN_UNIVERSE = "NIFTY100"
+```
+
+to:
+
+```python
+SCAN_UNIVERSE = "WATCHLIST"
+```
+
+That restores the earlier ten-stock scanner and its custom-symbol input. The code update is also isolated in its own Git commit, so it can be reverted without resetting other project history.
+
+## Original watchlist
+
+The rollback watchlist is the ten largest Nifty 50 constituents by weight according to the May 29, 2026 Nifty Indices factsheet. Index membership and weights change; edit the `WATCHLIST` dictionary near the top of `main.py` when you want a different set. NSE Yahoo Finance symbols use the `.NS` suffix.
+
+In `WATCHLIST` rollback mode, you can also add symbols without changing code: in the dashboard's left sidebar, enter comma-separated Yahoo Finance symbols in **Add your own Yahoo Finance symbols**, for example `WIPRO.NS, TATAMOTORS.NS`. If Yahoo Finance does not recognize a symbol, that row appears under **Data issues**.
 
 ## Indicators and rules
 
@@ -81,7 +108,7 @@ The **Paper trade log** is in-memory for the current browser session only. It is
 
 The app asks yfinance for two years of daily adjusted OHLCV data, enough history for the 200-day average, and separately downloads Nifty 50 closes for the regime filter. Data is cached for 15 minutes; use **Refresh market data** to clear both caches. A network failure, rate limit, missing symbol, or short history is shown in the dashboard instead of stopping the whole scan. If the Nifty data is unavailable, the stock scan continues but BUY setups are paused.
 
-This is a technical screening example for research and education. The current Update 5 settings have not yet been backtested or validated as profitable. Earlier versions had limited one-year historical simulations; those do not predict future results. The dashboard does not consider your financial circumstances and is not personalized financial advice. It only uses holdings details you enter for the selected stock; it cannot verify your portfolio, capital, risk tolerance, or tax situation. Review the chart, data date, and rules yourself; the dashboard never connects to a broker or places trades.
+This is a technical screening example for research and education. The Nifty 100 leaderboard has not yet been backtested or validated as profitable. Earlier strategy simulations used only the ten-stock watchlist and do not validate the expanded universe or predict future results. The dashboard does not consider your financial circumstances and is not personalized financial advice. It only uses holdings details you enter for the selected stock; it cannot verify your portfolio, capital, risk tolerance, or tax situation. Review the chart, data date, and rules yourself; the dashboard never connects to a broker or places trades.
 
 ## Strategy revision history
 
@@ -91,3 +118,4 @@ This is a technical screening example for research and education. The current Up
 - **Update 3:** Adds a Nifty 50 / SMA 50 regime filter. Bull mode uses a 4 × ATR target and +2.5 × ATR breakeven trigger; Defensive mode uses a 2 × ATR target and +1 × ATR breakeven trigger. The regime-specific multiples are locked at signal time; price levels are anchored to the next-open paper entry.
 - **Update 4:** Switches the market filter to Nifty 50 / SMA 200 and requires BUY score ≥+20 with RSI strictly between 40 and 70. Bull mode remains 4 × ATR / +2.5 × ATR; Defensive mode changes to 3 × ATR / +2 × ATR. The initial stop stays fixed at 2 × ATR.
 - **Update 5:** Adds a 50% scale-out at +2 × ATR in Bull mode or +1.5 × ATR in Defensive mode; the remaining stop moves to entry, with final targets of +4 × ATR / +3 × ATR. Adds a 12-session time stop that queues exit for the next open, plus an ownership panel that estimates management levels from the user's entered average price and entry date.
+- **Update 6:** Makes a Nifty 100 Top 10 leaderboard the main scanner. It filters for Nifty 50 Bull alignment, close above each stock's SMA 200, and RSI 40–70; ranks by the existing Directional Score; and adds a weekday 16:30 IST GitHub Actions scan. Tomorrow's open is shown as TBD, with close-based provisional stop/scale-out/target prices. Set `SCAN_UNIVERSE = "WATCHLIST"` to restore the previous scanner.
