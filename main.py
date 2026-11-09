@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import inspect
 import json
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -143,7 +144,60 @@ def download_scheduled_nifty100_scan() -> dict:
 @st.cache_data(ttl=900, show_spinner=False)
 def scan_nifty100_cached(extra_symbols: tuple[str, ...] = ()) -> dict:
     """Run the live Nifty 100 engine, optionally including sidebar-added symbols."""
-    return scan_nifty100(download_nifty_close(), extra_symbols=extra_symbols)
+    nifty_close = download_nifty_close()
+    accepts_extra_symbols = "extra_symbols" in inspect.signature(scan_nifty100).parameters
+    if accepts_extra_symbols:
+        payload = scan_nifty100(nifty_close, extra_symbols=extra_symbols)
+    else:
+        # A hosted process can briefly have the new dashboard and old engine loaded
+        # together during a partial refresh. Keep serving the old one-argument engine.
+        payload = scan_nifty100(nifty_close)
+        payload["compatibility_notice"] = "The scanner engine is refreshing. Added sidebar symbols were evaluated by the dashboard compatibility path."
+
+        regime = payload.get("market_regime", "Unavailable")
+        existing = {row.get("Symbol"): row for row in payload.get("results", [])}
+        for row in payload.get("results", []):
+            row.setdefault("Universe", "Nifty 100")
+            # The legacy engine only returned candidates after these filters passed.
+            row.setdefault("Filter status", "Pass")
+
+        errors = payload.setdefault("errors", [])
+        for symbol in extra_symbols:
+            if symbol in existing:
+                existing[symbol]["Universe"] = "Added"
+                continue
+            try:
+                candidate = evaluate(symbol, symbol.removesuffix(".NS"), 80.0, 0.5, 40.0, "Flexible score", regime)
+                reasons = []
+                if regime != "Bull":
+                    reasons.append("Nifty 50 is below its 200-day SMA")
+                if candidate["Price"] <= candidate["SMA200"]:
+                    reasons.append("Price is at/below its 200-day SMA")
+                if not 40 <= candidate["RSI (14)"] <= 70:
+                    reasons.append("RSI is outside 40–70")
+                eligible = not reasons
+                target_multiple, scale_multiple = market_risk_parameters(regime)
+                candidate.update({
+                    "Universe": "Added",
+                    "Filter status": "Pass" if eligible else "Filtered: " + "; ".join(reasons),
+                    "Action": ("BUY" if candidate["Score"] >= 20 and 40 < candidate["RSI (14)"] < 70 else "WATCH") if eligible else "NOT ELIGIBLE",
+                    "Reason": ("Passes Nifty alignment, SMA 200, and RSI 40–70. " if eligible else "Does not pass: " + "; ".join(reasons) + ". ") + candidate["Reason"],
+                    "Target ATR multiple": float(target_multiple),
+                    "Scale-out ATR multiple": float(scale_multiple),
+                    "Scale-out level": candidate["Price"] + scale_multiple * candidate["ATR (14)"],
+                    "Entry plan": "Next market open · TBD",
+                    "Paper status": "User-added symbol · leaderboard research only",
+                    "Paper entry": None,
+                    "Paper regime": regime,
+                    "Sessions held": None,
+                })
+                payload.setdefault("results", []).append(candidate)
+                existing[symbol] = candidate
+            except Exception as exc:
+                errors.append({"Symbol": symbol, "Error": str(exc)[:160]})
+
+        payload["eligible_count"] = sum(row.get("Filter status") == "Pass" for row in payload.get("results", []))
+    return payload
 
 
 def get_market_regime() -> dict:
@@ -865,6 +919,8 @@ def main() -> None:
         custom_rows = [row for row in all_scan_results if row.get("Universe") == "Added" and row["Symbol"] not in leader_symbols]
         results = leaders + custom_rows
         errors = scan_payload.get("errors", [])
+        if scan_payload.get("compatibility_notice"):
+            st.caption(scan_payload["compatibility_notice"])
     else:
         watchlist = dict(WATCHLIST)
         for raw_symbol in added_symbols.split(","):
