@@ -13,9 +13,9 @@ import yfinance as yf
 NIFTY100_CONSTITUENTS_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty100list.csv"
 HISTORY_PERIOD = "2y"
 CHUNK_SIZE = 20
-NIFTY100_SCORE_MAX_PE = 60.0
-NIFTY100_MIN_SHARPE = 0.0
-NIFTY100_MAX_DRAWDOWN_PCT = 50.0
+NIFTY100_SCORE_MAX_PE = 80.0
+NIFTY100_MIN_SHARPE = 0.5
+NIFTY100_MAX_DRAWDOWN_PCT = 40.0
 
 
 def fetch_nifty100_constituents() -> list[dict[str, str]]:
@@ -116,12 +116,26 @@ def fetch_price_history(constituents: list[dict[str, str]]) -> tuple[dict[str, p
     return histories, errors
 
 
-def scan_nifty100(nifty_close: pd.Series | None = None) -> dict:
-    """Apply the existing directional score and Nifty 100 eligibility gates."""
+def scan_nifty100(nifty_close: pd.Series | None = None, extra_symbols: tuple[str, ...] = ()) -> dict:
+    """Scan Nifty 100 plus user-added Yahoo symbols; keep additions visible if filtered."""
     # Imported only when the scan starts so main.py can also import this module.
     import main
 
     constituents = fetch_nifty100_constituents()
+    official_symbols = {item["symbol"] for item in constituents}
+    official_count = len(constituents)
+    extra_constituents = []
+    requested_symbols = set()
+    for raw_symbol in extra_symbols:
+        symbol = str(raw_symbol).strip().upper()
+        if not symbol:
+            continue
+        if "." not in symbol:
+            symbol = f"{symbol}.NS"
+        requested_symbols.add(symbol)
+        if symbol not in official_symbols and all(item["symbol"] != symbol for item in extra_constituents):
+            extra_constituents.append({"symbol": symbol, "company": symbol.removesuffix(".NS").replace("-", " ")})
+    constituents.extend(extra_constituents)
     if nifty_close is None:
         nifty_close = main.download_nifty_close()
     nifty_close = pd.to_numeric(nifty_close, errors="coerce").dropna()
@@ -137,7 +151,8 @@ def scan_nifty100(nifty_close: pd.Series | None = None) -> dict:
         "as_of": as_of.strftime("%Y-%m-%d"),
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "universe": "Nifty 100",
-        "constituents": len(constituents),
+        "constituents": official_count,
+        "scanned_symbols": len(constituents),
         "market_regime": regime,
         "nifty_close": market_price,
         "nifty_sma200": market_sma,
@@ -147,12 +162,9 @@ def scan_nifty100(nifty_close: pd.Series | None = None) -> dict:
         "message": "",
     }
 
-    if regime != "Bull":
-        payload["message"] = "Nifty 50 closed at or below its 200-day SMA. The long-only alignment filter removed all candidates."
-        return payload
-
     histories, errors = fetch_price_history(constituents)
     names = {item["symbol"]: item["company"] for item in constituents}
+    custom_symbols = requested_symbols
     records = []
     for symbol, history in histories.items():
         try:
@@ -166,8 +178,18 @@ def scan_nifty100(nifty_close: pd.Series | None = None) -> dict:
 
             price = float(last["Close"])
             rsi = float(last["RSI"])
-            # Explicit noise filters requested for the Nifty 100 leaderboard.
-            if price <= float(last["SMA200"]) or not 40 <= rsi <= 70:
+            # Official-universe stocks must pass every gate. User-added tickers stay
+            # visible even when filtered so the table explains why they did not qualify.
+            filter_reasons = []
+            if regime != "Bull":
+                filter_reasons.append("Nifty 50 is below its 200-day SMA")
+            if price <= float(last["SMA200"]):
+                filter_reasons.append("Price is at/below its 200-day SMA")
+            if not 40 <= rsi <= 70:
+                filter_reasons.append("RSI is outside 40–70")
+            eligible = not filter_reasons
+            is_custom = symbol in custom_symbols
+            if not eligible and not is_custom:
                 continue
 
             atr = float(last["ATR"])
@@ -179,7 +201,6 @@ def scan_nifty100(nifty_close: pd.Series | None = None) -> dict:
             sharpe = float(last["Sharpe 1Y"]) if pd.notna(last["Sharpe 1Y"]) else None
             max_dd = float(last["Max DD 1Y %"]) if pd.notna(last["Max DD 1Y %"]) else None
 
-            # Fundamentals are requested only for technically eligible stocks.
             # A missing P/E is omitted just as it is in the existing score.
             pe = main.download_pe(symbol)
             factors = [
@@ -217,17 +238,19 @@ def scan_nifty100(nifty_close: pd.Series | None = None) -> dict:
                 factors.append(("Trailing P/E filter", 4, -1.0 if pe <= 0 else (0.5 if pe <= NIFTY100_SCORE_MAX_PE else -0.5)))
 
             score, rating, reason = main.weighted_score(factors)
-            action = "BUY" if score >= 20 and 40 < rsi < 70 else "WATCH"
+            action = "BUY" if eligible and score >= 20 and 40 < rsi < 70 else ("WATCH" if eligible else "NOT ELIGIBLE")
             target_multiple, scale_multiple = main.market_risk_parameters(regime)
             records.append({
                 "Company": names.get(symbol, symbol),
                 "Symbol": symbol,
+                "Universe": "Added" if is_custom else "Nifty 100",
+                "Filter status": "Pass" if eligible else "Filtered: " + "; ".join(filter_reasons),
                 "Date": as_of.strftime("%d %b %Y"),
                 "Action": action,
                 "Rating": rating,
                 "Score": int(score),
                 "Scenario": "Long",
-                "Reason": f"Nifty 100 leader: price above SMA 200 and RSI is 40–70. {reason}",
+                "Reason": ("Passes Nifty 50 alignment, price above SMA 200, and RSI 40–70. " if eligible else "Does not pass: " + "; ".join(filter_reasons) + ". ") + reason,
                 "Market regime": regime,
                 "Target ATR multiple": float(target_multiple),
                 "Scale-out ATR multiple": float(scale_multiple),
@@ -240,7 +263,7 @@ def scan_nifty100(nifty_close: pd.Series | None = None) -> dict:
                 "Reward %": target_multiple * atr / price * 100,
                 "Reward/Risk": target_multiple / main.ATR_STOP_MULTIPLE,
                 "RSI (14)": rsi,
-                "Trend": "Above SMA 200",
+                "Trend": "Above SMA 200" if price > float(last["SMA200"]) else "At/below SMA 200",
                 "Volume vs avg": volume_ratio,
                 "SMA20": float(last["SMA20"]),
                 "SMA50": float(last["SMA50"]),
@@ -254,7 +277,7 @@ def scan_nifty100(nifty_close: pd.Series | None = None) -> dict:
                 "P/E": pe,
                 "Sharpe 1Y": sharpe,
                 "Max DD 1Y %": max_dd,
-                "Paper status": "Leaderboard research only · no order placed",
+                "Paper status": "User-added symbol · leaderboard research only" if is_custom else "Leaderboard research only · no order placed",
                 "Paper entry": None,
                 "Paper regime": regime,
                 "Sessions held": None,
@@ -262,8 +285,8 @@ def scan_nifty100(nifty_close: pd.Series | None = None) -> dict:
         except Exception as exc:
             errors.append({"Symbol": symbol, "Error": str(exc)[:160]})
 
-    records.sort(key=lambda row: (row["Score"], row["MACD"] > row["MACD Signal"], row["ADX (14)"]), reverse=True)
-    payload["eligible_count"] = len(records)
+    records.sort(key=lambda row: (row["Universe"] != "Added", row["Filter status"] == "Pass", row["Score"], row["MACD"] > row["MACD Signal"], row["ADX (14)"]), reverse=True)
+    payload["eligible_count"] = sum(row["Filter status"] == "Pass" for row in records)
     payload["results"] = records
     payload["errors"] = errors
     if not records:

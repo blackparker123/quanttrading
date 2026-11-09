@@ -140,9 +140,9 @@ def download_scheduled_nifty100_scan() -> dict:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def scan_nifty100_cached() -> dict:
-    """Run the Nifty 100 engine live when a current scheduled scan is unavailable."""
-    return scan_nifty100(download_nifty_close())
+def scan_nifty100_cached(extra_symbols: tuple[str, ...] = ()) -> dict:
+    """Run the live Nifty 100 engine, optionally including sidebar-added symbols."""
+    return scan_nifty100(download_nifty_close(), extra_symbols=extra_symbols)
 
 
 def get_market_regime() -> dict:
@@ -763,7 +763,7 @@ def main() -> None:
             st.caption("The Nifty 100 leaderboard always ranks by the Flexible Directional Score.")
             st.write("Main scanner: Nifty 100 Top 10 leaderboard. To return to the original 10-stock list, change `SCAN_UNIVERSE` near the top of `main.py` to `WATCHLIST`.")
             max_pe, min_sharpe, max_drawdown_pct = 60.0, 0.0, 50
-            st.caption("Score settings in this mode: maximum P/E 60, minimum 1Y Sharpe 0, maximum historical drawdown 50%.")
+            st.caption("Score settings: P/E reference ceiling 80, preferred 1Y Sharpe ≥ 0.5, preferred historical drawdown ≤ 40%.")
         else:
             signal_mode = st.selectbox(
                 "Signal mode",
@@ -778,7 +778,7 @@ def main() -> None:
             added_symbols = st.text_input(
                 "Add your own Yahoo Finance symbols",
                 placeholder="WIPRO.NS, TATAMOTORS.NS",
-                help="Enter one or more symbols separated by commas. For NSE shares, Yahoo symbols usually end in .NS. Custom symbols are included in WATCHLIST rollback mode.",
+                help="Enter one or more Yahoo Finance symbols separated by commas. NSE shares can be entered as TCS or TCS.NS. In Nifty 100 mode, these stocks are added to the leaderboard.",
             )
             st.form_submit_button("Apply symbols")
         if st.button("Refresh market data", type="primary", width="stretch"):
@@ -807,22 +807,40 @@ def main() -> None:
     leaderboard_mode = SCAN_UNIVERSE == "NIFTY100"
     scan_payload = None
     if leaderboard_mode:
+        extra_symbols = tuple(dict.fromkeys(
+            (symbol.strip().upper() + ".NS") if symbol.strip() and "." not in symbol.strip()
+            else symbol.strip().upper()
+            for symbol in added_symbols.split(",") if symbol.strip()
+        ))
         market_date = pd.to_datetime(market["date"]).strftime("%Y-%m-%d") if market.get("date") else None
-        with st.spinner("Loading the latest Nifty 100 background scan…"):
+        with st.spinner("Loading the Nifty 100 scan and your added stocks…"):
             try:
-                scheduled = download_scheduled_nifty100_scan()
-            except Exception:
-                scheduled = None
-            if scheduled and scheduled.get("as_of") == market_date:
-                scan_payload = scheduled
-            else:
-                if scheduled and market_date and scheduled.get("as_of") != market_date:
-                    st.caption("The scheduled leaderboard is from an earlier market close; refreshing the Nifty 100 scan now.")
-                try:
-                    scan_payload = scan_nifty100_cached()
-                except Exception as exc:
-                    scan_payload = {"results": [], "errors": [], "message": str(exc)[:220]}
-        results = scan_payload.get("results", [])[:10]
+                if extra_symbols:
+                    # The scheduled scan contains only the official Nifty 100. Run live
+                    # when personal symbols are present so they enter the same table.
+                    scan_payload = scan_nifty100_cached(extra_symbols)
+                else:
+                    try:
+                        scheduled = download_scheduled_nifty100_scan()
+                    except Exception:
+                        scheduled = None
+                    has_current_schema = bool(scheduled) and all(
+                        "Universe" in row and "Filter status" in row
+                        for row in scheduled.get("results", [])
+                    )
+                    if scheduled and scheduled.get("as_of") == market_date and has_current_schema:
+                        scan_payload = scheduled
+                    else:
+                        if scheduled and market_date and scheduled.get("as_of") != market_date:
+                            st.caption("The scheduled leaderboard is from an earlier market close; refreshing the Nifty 100 scan now.")
+                        scan_payload = scan_nifty100_cached()
+            except Exception as exc:
+                scan_payload = {"results": [], "errors": [], "message": str(exc)[:220]}
+        all_scan_results = scan_payload.get("results", [])
+        leaders = [row for row in all_scan_results if row.get("Universe") != "Added"][:10]
+        leader_symbols = {row["Symbol"] for row in leaders}
+        custom_rows = [row for row in all_scan_results if row.get("Universe") == "Added" and row["Symbol"] not in leader_symbols]
+        results = leaders + custom_rows
         errors = scan_payload.get("errors", [])
     else:
         watchlist = dict(WATCHLIST)
@@ -841,7 +859,7 @@ def main() -> None:
 
     if not results:
         if leaderboard_mode:
-            st.info(scan_payload.get("message") or "No Nifty 100 stocks passed the alignment, RSI, and 200-day SMA filters today.")
+            st.info(scan_payload.get("message") or "No Nifty 100 stocks passed the alignment, RSI, and 200-day SMA filters today. Add a symbol in the sidebar to include it in this table.")
             if scan_payload.get("as_of"):
                 st.caption(f"Background or live scan date: {scan_payload['as_of']} · Nifty 100 constituents: {scan_payload.get('constituents', '—')}.")
         else:
@@ -860,16 +878,17 @@ def main() -> None:
     if leaderboard_mode:
         metric_cols = st.columns(3)
         metric_cols[0].metric("Stocks passing filters", scan_payload.get("eligible_count", len(results)))
-        metric_cols[1].metric("Top 10 shown", len(results))
+        metric_cols[1].metric("Top 10 leaders", len(leaders))
         metric_cols[2].metric("Nifty 50 alignment", scan_payload.get("market_regime", market["name"]))
         st.subheader("Nifty 100 · Top 10 by Directional Score")
         st.caption(
             f"As of {scan_payload.get('as_of', 'unknown')}. Candidates pass the Nifty 50 Bull-regime, stock-above-SMA-200, "
-            "and RSI 40–70 filters. The next session's opening price is unknown until the market opens; starred levels are provisional from the latest close."
+            "and RSI 40–70 filters. Symbols entered in the sidebar are appended below the leaders and show whether they pass those filters. "
+            "The next session's opening price is unknown until the market opens; starred levels are provisional from the latest close."
         )
-        display = frame[["Company", "Symbol", "Action", "Rating", "Score", "RSI (14)", "Price", "Entry plan", "Stop loss", "Scale-out level", "Target"]].copy()
-        display.insert(0, "Rank", range(1, len(display) + 1))
-        display.rename(columns={"Price": "Close ref", "Stop loss": "2×ATR stop*", "Scale-out level": "Sell 50%*", "Target": "Final target*"}, inplace=True)
+        display = frame[["Company", "Symbol", "Universe", "Filter status", "Action", "Rating", "Score", "RSI (14)", "Price", "Entry plan", "Stop loss", "Scale-out level", "Target"]].copy()
+        display.insert(0, "Rank", [str(i) if row.get("Universe") != "Added" else "Added" for i, row in enumerate(results, start=1)])
+        display.rename(columns={"Universe": "List", "Price": "Close ref", "Stop loss": "2×ATR stop*", "Scale-out level": "Sell 50%*", "Target": "Final target*"}, inplace=True)
         display["Score"] = display["Score"].map(lambda value: f"{value:+d}/100")
         display["RSI (14)"] = display["RSI (14)"].map(lambda value: f"{value:.1f}")
         for column in ("Close ref", "2×ATR stop*", "Sell 50%*", "Final target*"):
@@ -893,8 +912,9 @@ def main() -> None:
         display["Reward/Risk"] = display["Reward/Risk"].map(lambda value: "—" if pd.isna(value) else f"{value:.1f}:1")
         st.dataframe(display, hide_index=True, width="stretch", height=min(560, 42 + 40 * len(display)))
 
-    chosen = st.selectbox("Stock details", frame["Company"].tolist(), label_visibility="collapsed")
-    selected = frame.loc[frame["Company"] == chosen].iloc[0]
+    choice_labels = {f"{row['Company']} · {row['Symbol']}": row["Symbol"] for row in results}
+    chosen = st.selectbox("Stock details", list(choice_labels), label_visibility="collapsed")
+    selected = frame.loc[frame["Symbol"] == choice_labels[chosen]].iloc[0]
     selected_history = add_indicators(download_history(selected["Symbol"]))
     left, right = st.columns([1, 1.4], gap="large")
     with left:

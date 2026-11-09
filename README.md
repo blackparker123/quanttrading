@@ -49,6 +49,10 @@ The GitHub Actions workflow runs on weekdays at 16:30 India Standard Time and pu
 
 The next session's opening price is not knowable after today's close. The dashboard therefore labels the entry as **Next open · TBD** and estimates the 2 × ATR stop, 50% scale-out, and final target from today's close. After an actual entry, recalculate those levels from the real opening fill. The app does not submit orders.
 
+To include a stock in the same table, use **Add your own Yahoo Finance symbols** in the left sidebar, enter one or more symbols separated by commas (for example `WIPRO.NS, TATAMOTORS.NS` or `TCS`), and click **Apply symbols**. The app adds those symbols below the Top 10 leaders with a **List = Added** label. It displays them even if they fail the Nifty regime, SMA 200, or RSI filter, and shows the reason in **Filter status**. A ticker that Yahoo Finance cannot load is listed under **Data issues**. Personal additions require a live scan and remain in the open dashboard session; the scheduled scan continues to cover only Nifty 100 constituents.
+
+The scoring references are set to P/E 80, preferred 1-year Sharpe 0.5, and preferred maximum drawdown 40%. These factors affect the Directional Score; they are not hard exclusion filters. The explicit eligibility filters remain the Nifty 50 regime, price above SMA 200, and RSI 40–70.
+
 ### Roll back to the original scanner
 
 Near the top of `main.py`, change:
@@ -69,7 +73,7 @@ That restores the earlier ten-stock scanner and its custom-symbol input. The cod
 
 The rollback watchlist is the ten largest Nifty 50 constituents by weight according to the May 29, 2026 Nifty Indices factsheet. Index membership and weights change; edit the `WATCHLIST` dictionary near the top of `main.py` when you want a different set. NSE Yahoo Finance symbols use the `.NS` suffix.
 
-In `WATCHLIST` rollback mode, you can also add symbols without changing code: in the dashboard's left sidebar, enter comma-separated Yahoo Finance symbols in **Add your own Yahoo Finance symbols**, for example `WIPRO.NS, TATAMOTORS.NS`. If Yahoo Finance does not recognize a symbol, that row appears under **Data issues**.
+In either mode, you can add symbols without changing code using the dashboard's left sidebar. In `WATCHLIST` rollback mode they join the scan. In Nifty 100 mode they appear beneath the Top 10 as described above.
 
 ## Indicators and rules
 
