@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+from urllib.parse import urlencode
 from urllib.request import urlopen
 
 import pandas as pd
@@ -749,7 +750,27 @@ def make_candlestick_chart(data: pd.DataFrame, show_sma20: bool, show_sma50: boo
 
 
 def main() -> None:
-    st.title("📈 QuantTrading")
+    full_list_view = st.query_params.get("view") == "all"
+    query_symbols = st.query_params.get("symbols", "")
+    active_symbols = st.session_state.get("custom_symbols_input", "") or query_symbols
+    link_params = {"view": "all"}
+    if active_symbols.strip():
+        link_params["symbols"] = active_symbols
+    full_list_url = "?" + urlencode(link_params)
+    header_left, header_right = st.columns([5, 2])
+    header_left.title("📈 QuantTrading")
+    if SCAN_UNIVERSE == "NIFTY100":
+        if full_list_view:
+            header_right.markdown(
+                '<a href="/" style="display:block;text-align:right;padding:0.5rem 0;">← Back to dashboard</a>',
+                unsafe_allow_html=True,
+            )
+        else:
+            header_right.markdown(
+                f'<a href="{full_list_url}" target="_blank" rel="noopener noreferrer" '
+                'style="display:block;text-align:right;padding:0.5rem 0;">View all passing stocks ↗</a>',
+                unsafe_allow_html=True,
+            )
     st.caption("Indian cash-equity swing research · Daily data · No order placement")
     st.info(
         "Signals are indicator-based research outputs from recent market data, not personalized financial advice. "
@@ -779,6 +800,7 @@ def main() -> None:
                 "Add your own Yahoo Finance symbols",
                 placeholder="WIPRO.NS, TATAMOTORS.NS",
                 help="Enter one or more Yahoo Finance symbols separated by commas. NSE shares can be entered as TCS or TCS.NS. In Nifty 100 mode, these stocks are added to the leaderboard.",
+                key="custom_symbols_input",
             )
             st.form_submit_button("Apply symbols")
         if st.button("Refresh market data", type="primary", width="stretch"):
@@ -807,10 +829,11 @@ def main() -> None:
     leaderboard_mode = SCAN_UNIVERSE == "NIFTY100"
     scan_payload = None
     if leaderboard_mode:
+        requested_symbols = ",".join(part for part in (added_symbols, query_symbols) if part.strip())
         extra_symbols = tuple(dict.fromkeys(
             (symbol.strip().upper() + ".NS") if symbol.strip() and "." not in symbol.strip()
             else symbol.strip().upper()
-            for symbol in added_symbols.split(",") if symbol.strip()
+            for symbol in requested_symbols.split(",") if symbol.strip()
         ))
         market_date = pd.to_datetime(market["date"]).strftime("%Y-%m-%d") if market.get("date") else None
         with st.spinner("Loading the Nifty 100 scan and your added stocks…"):
@@ -856,6 +879,29 @@ def main() -> None:
                     results.append(evaluate(symbol, company, max_pe, min_sharpe, float(max_drawdown_pct), signal_mode, market["name"]))
                 except Exception as exc:
                     errors.append({"Symbol": symbol, "Company": company, "Error": str(exc)[:180]})
+
+    if full_list_view and leaderboard_mode:
+        all_eligible = [row for row in scan_payload.get("results", []) if row.get("Filter status") == "Pass"]
+        all_eligible.sort(key=lambda row: row.get("Score", -10_000), reverse=True)
+        st.subheader("All stocks passing the filters")
+        st.caption(
+            f"{len(all_eligible)} stocks · As of {scan_payload.get('as_of', 'unknown')}. "
+            "Entry prices below use the latest closing price as a reference; the next session's actual opening price is not known yet."
+        )
+        if all_eligible:
+            all_display = pd.DataFrame({
+                "Stock": [f"{row['Company']} ({row['Symbol']})" for row in all_eligible],
+                "Entry price*": [money(row["Price"]) for row in all_eligible],
+                "Score rating": [f"{row['Rating']} ({row['Score']:+d}/100)" for row in all_eligible],
+            })
+            st.dataframe(all_display, hide_index=True, width="stretch", height=min(760, 46 + 44 * len(all_display)))
+            st.caption("* Provisional close reference only; re-check against the actual market open before considering an entry. No orders are placed.")
+        else:
+            st.info(scan_payload.get("message") or "No stocks currently pass the Nifty alignment, SMA 200, and RSI filters.")
+        if errors:
+            with st.expander(f"Data issues ({len(errors)} symbols)"):
+                st.dataframe(pd.DataFrame(errors), hide_index=True, width="stretch")
+        return
 
     if not results:
         if leaderboard_mode:

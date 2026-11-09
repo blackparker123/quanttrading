@@ -51,6 +51,8 @@ The next session's opening price is not knowable after today's close. The dashbo
 
 To include a stock in the same table, use **Add your own Yahoo Finance symbols** in the left sidebar, enter one or more symbols separated by commas (for example `WIPRO.NS, TATAMOTORS.NS` or `TCS`), and click **Apply symbols**. The app adds those symbols below the Top 10 leaders with a **List = Added** label. It displays them even if they fail the Nifty regime, SMA 200, or RSI filter, and shows the reason in **Filter status**. A ticker that Yahoo Finance cannot load is listed under **Data issues**. Personal additions require a live scan and remain in the open dashboard session; the scheduled scan continues to cover only Nifty 100 constituents.
 
+Use **View all passing stocks** in the top-right corner to open a separate tab with every qualifying stock, its provisional entry-price reference, and its score rating. The list uses each stock's latest close because the next session's opening price is not knowable in advance.
+
 The scoring references are set to P/E 80, preferred 1-year Sharpe 0.5, and preferred maximum drawdown 40%. These factors affect the Directional Score; they are not hard exclusion filters. The explicit eligibility filters remain the Nifty 50 regime, price above SMA 200, and RSI 40–70.
 
 ### Roll back to the original scanner
