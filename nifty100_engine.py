@@ -116,7 +116,11 @@ def fetch_price_history(constituents: list[dict[str, str]]) -> tuple[dict[str, p
     return histories, errors
 
 
-def scan_nifty100(nifty_close: pd.Series | None = None, extra_symbols: tuple[str, ...] = ()) -> dict:
+def scan_nifty100(
+    nifty_close: pd.Series | None = None,
+    extra_symbols: tuple[str, ...] = (),
+    max_price: float | None = None,
+) -> dict:
     """Scan Nifty 100 plus user-added Yahoo symbols; keep additions visible if filtered."""
     # Imported only when the scan starts so main.py can also import this module.
     import main
@@ -187,6 +191,10 @@ def scan_nifty100(nifty_close: pd.Series | None = None, extra_symbols: tuple[str
                 filter_reasons.append("Price is at/below its 200-day SMA")
             if not 40 <= rsi <= 70:
                 filter_reasons.append("RSI is outside 40–70")
+            if max_price is not None and price >= max_price:
+                # The limited-account ceiling is a hard universe filter, including
+                # user-added symbols, so excluded prices never enter the leaderboard.
+                continue
             eligible = not filter_reasons
             is_custom = symbol in custom_symbols
             if not eligible and not is_custom:

@@ -43,7 +43,7 @@ On macOS/Linux, use `python3 -m venv .venv`, `source .venv/bin/activate`, `pytho
 
 ## Main scanner: Nifty 100 leaderboard
 
-The main mode reads the current constituent list from the [official NSE Nifty 100 page](https://www.nseindia.com/static/products-services/indices-nifty100-index), downloads adjusted daily OHLCV in batches, and ranks eligible stocks by the existing Directional Score. A stock is eligible only when Nifty 50 is above its 200-day SMA, the stock closes above its own 200-day SMA, and RSI is between 40 and 70. The dashboard shows up to the ten highest-scoring eligible stocks.
+The main mode reads the current constituent list from the [official NSE Nifty 100 page](https://www.nseindia.com/static/products-services/indices-nifty100-index), downloads adjusted daily OHLCV in batches, and ranks eligible stocks by the existing Directional Score. A stock is eligible only when Nifty 50 is above its 200-day SMA, the stock closes above its own 200-day SMA, and RSI is between 40 and 70. Standard mode shows up to the ten highest-scoring eligible stocks; the sidebar's **Under ₹2L** setting applies the Limited Portfolio Growth filters and Top 3 cap.
 
 The GitHub Actions workflow runs on weekdays at 16:30 India Standard Time and publishes the latest JSON result on a separate `daily-scan` branch. When that day's scan is not available, the dashboard runs the scan live instead. GitHub-hosted scheduled jobs can start late, and market holidays may produce no new candle; the date shown with the leaderboard identifies the data it used. The workflow can also be started manually from the repository's **Actions** tab.
 
@@ -54,6 +54,10 @@ To include a stock in the same table, use **Add your own Yahoo Finance symbols**
 Use **View all passing stocks** in the top-right corner to open a separate tab with every qualifying stock, its provisional entry-price reference, and its score rating. The list uses each stock's latest close because the next session's opening price is not knowable in advance.
 
 The scoring references are set to P/E 80, preferred 1-year Sharpe 0.5, and preferred maximum drawdown 40%. These factors affect the Directional Score; they are not hard exclusion filters. The explicit eligibility filters remain the Nifty 50 regime, price above SMA 200, and RSI 40–70.
+
+The sidebar **Account Size** radio offers **Standard** and **Under ₹2L**. Standard keeps the Top 10 screen and its existing scale-out plan. Under ₹2L activates **Limited Portfolio Growth**: it runs a live scan, excludes closes of ₹1,000 or more before ranking, and shows at most the three highest-scoring stocks that pass the regular eligibility filters. Its single-target plan uses a fixed 2 × ATR stop and one final target (4 × ATR in Bull regime, 3 × ATR in Defensive regime); it hides all partial-exit prompts. The setting only changes the screen and displayed plan: it does not allocate a fixed ₹50,000, calculate share quantities, include broker-specific charges, or place orders.
+
+When you mark that you own a selected stock in Limited Portfolio Growth, the holding panel counts daily sessions from the entered date. It shows a red **CAPITAL TRAPPED — Day 11 of 12** warning, then identifies the 12-session time stop and next-open exit rule after the 12th close. The alert is a research prompt; the app cannot see your brokerage position or submit an exit.
 
 ### Roll back to the original scanner
 
@@ -125,3 +129,4 @@ This is a technical screening example for research and education. The Nifty 100 
 - **Update 4:** Switches the market filter to Nifty 50 / SMA 200 and requires BUY score ≥+20 with RSI strictly between 40 and 70. Bull mode remains 4 × ATR / +2.5 × ATR; Defensive mode changes to 3 × ATR / +2 × ATR. The initial stop stays fixed at 2 × ATR.
 - **Update 5:** Adds a 50% scale-out at +2 × ATR in Bull mode or +1.5 × ATR in Defensive mode; the remaining stop moves to entry, with final targets of +4 × ATR / +3 × ATR. Adds a 12-session time stop that queues exit for the next open, plus an ownership panel that estimates management levels from the user's entered average price and entry date.
 - **Update 6:** Makes a Nifty 100 Top 10 leaderboard the main scanner. It filters for Nifty 50 Bull alignment, close above each stock's SMA 200, and RSI 40–70; ranks by the existing Directional Score; and adds a weekday 16:30 IST GitHub Actions scan. Tomorrow's open is shown as TBD, with close-based provisional stop/scale-out/target prices. Set `SCAN_UNIVERSE = "WATCHLIST"` to restore the previous scanner.
+- **Update 7:** Adds a sidebar account-size choice. Under ₹2L activates Limited Portfolio Growth: Top 3 eligible stocks with close below ₹1,000, one 2 × ATR stop and one regime-based final target, plus a Day 11 capital-velocity warning and the existing 12-session exit rule. Standard mode preserves the earlier Top 10 and scale-out behavior.

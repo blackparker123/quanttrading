@@ -46,6 +46,8 @@ BULL_SCALE_OUT_ATR = 2.0
 DEFENSIVE_TARGET_ATR = 3.0
 DEFENSIVE_SCALE_OUT_ATR = 1.5
 PAPER_TIME_STOP_SESSIONS = 12
+LIMITED_MODE_TOP_N = 3
+LIMITED_MODE_PRICE_CEILING = 1000.0
 SCALE_OUT_FRACTION = 0.5
 BUY_VOLUME_MULTIPLE = 1.2
 ADX_MINIMUM = 20.0
@@ -142,12 +144,17 @@ def download_scheduled_nifty100_scan() -> dict:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def scan_nifty100_cached(extra_symbols: tuple[str, ...] = ()) -> dict:
-    """Run the live Nifty 100 engine, optionally including sidebar-added symbols."""
+def scan_nifty100_cached(extra_symbols: tuple[str, ...] = (), max_price: float | None = None) -> dict:
+    """Run the live Nifty 100 engine with optional custom tickers and a price ceiling."""
     nifty_close = download_nifty_close()
-    accepts_extra_symbols = "extra_symbols" in inspect.signature(scan_nifty100).parameters
-    if accepts_extra_symbols:
-        payload = scan_nifty100(nifty_close, extra_symbols=extra_symbols)
+    scanner_parameters = inspect.signature(scan_nifty100).parameters
+    if "extra_symbols" in scanner_parameters:
+        scanner_kwargs = {}
+        if "extra_symbols" in scanner_parameters:
+            scanner_kwargs["extra_symbols"] = extra_symbols
+        if "max_price" in scanner_parameters:
+            scanner_kwargs["max_price"] = max_price
+        payload = scan_nifty100(nifty_close, **scanner_kwargs)
     else:
         # A hosted process can briefly have the new dashboard and old engine loaded
         # together during a partial refresh. Keep serving the old one-argument engine.
@@ -197,6 +204,14 @@ def scan_nifty100_cached(extra_symbols: tuple[str, ...] = ()) -> dict:
                 errors.append({"Symbol": symbol, "Error": str(exc)[:160]})
 
         payload["eligible_count"] = sum(row.get("Filter status") == "Pass" for row in payload.get("results", []))
+    if max_price is not None:
+        payload["results"] = [
+            row for row in payload.get("results", [])
+            if pd.notna(row.get("Price")) and float(row["Price"]) < max_price
+        ]
+        payload["eligible_count"] = sum(row.get("Filter status") == "Pass" for row in payload["results"])
+        if not payload["results"]:
+            payload["message"] = f"No stocks below ₹{max_price:,.0f} passed the current market, SMA 200, and RSI filters."
     return payload
 
 
@@ -806,10 +821,16 @@ def make_candlestick_chart(data: pd.DataFrame, show_sma20: bool, show_sma50: boo
 def main() -> None:
     full_list_view = st.query_params.get("view") == "all"
     query_symbols = st.query_params.get("symbols", "")
+    account_size_default = st.session_state.get(
+        "account_size",
+        "Under ₹2L" if st.query_params.get("portfolio") == "limited" else "Standard",
+    )
     active_symbols = st.session_state.get("custom_symbols_input", "") or query_symbols
     link_params = {"view": "all"}
     if active_symbols.strip():
         link_params["symbols"] = active_symbols
+    if account_size_default == "Under ₹2L":
+        link_params["portfolio"] = "limited"
     full_list_url = "?" + urlencode(link_params)
     header_left, header_right = st.columns([5, 2])
     header_left.title("📈 QuantTrading")
@@ -834,12 +855,24 @@ def main() -> None:
     with st.sidebar:
         st.header("Scanner")
         if SCAN_UNIVERSE == "NIFTY100":
+            account_size = st.radio(
+                "Account Size",
+                ("Under ₹2L", "Standard"),
+                index=0 if account_size_default == "Under ₹2L" else 1,
+                key="account_size",
+                help="Under ₹2L enables the Limited Portfolio Growth screen: up to three candidates below ₹1,000, with one stop and one target. It does not allocate funds or place orders.",
+            )
+            limited_portfolio_mode = account_size == "Under ₹2L"
+            if limited_portfolio_mode:
+                st.caption("Limited Portfolio Growth · Top 3 · price below ₹1,000 · single-target plan")
             signal_mode = "Flexible score"
             st.caption("The Nifty 100 leaderboard always ranks by the Flexible Directional Score.")
-            st.write("Main scanner: Nifty 100 Top 10 leaderboard. To return to the original 10-stock list, change `SCAN_UNIVERSE` near the top of `main.py` to `WATCHLIST`.")
+            st.write("Main scanner: Nifty 100 leaderboard. To return to the original 10-stock list, change `SCAN_UNIVERSE` near the top of `main.py` to `WATCHLIST`.")
             max_pe, min_sharpe, max_drawdown_pct = 60.0, 0.0, 50
             st.caption("Score settings: P/E reference ceiling 80, preferred 1Y Sharpe ≥ 0.5, preferred historical drawdown ≤ 40%.")
         else:
+            account_size = "Standard"
+            limited_portfolio_mode = False
             signal_mode = st.selectbox(
                 "Signal mode",
                 ("Flexible score", "Strict rules"),
@@ -871,12 +904,18 @@ def main() -> None:
     market_columns = st.columns([1, 2])
     market_columns[0].metric("Nifty 50 regime", market["name"])
     if market["name"] != "Unavailable":
-        market_columns[1].caption(
-            f"Nifty 50 close {market['close']:,.2f} vs. 200-day SMA {market['sma200']:,.2f} "
-            f"on {market['date']}. Bull mode scales out 50% at +2× ATR, then targets +4× ATR; "
-            "Defensive mode scales out 50% at +1.5× ATR, then targets +3× ATR. After scale-out, "
-            "the remaining stop moves to entry."
-        )
+        if limited_portfolio_mode:
+            market_columns[1].caption(
+                f"Nifty 50 close {market['close']:,.2f} vs. 200-day SMA {market['sma200']:,.2f} on {market['date']}. "
+                "Limited mode uses one 2×ATR stop and one final target: +4×ATR in Bull mode or +3×ATR in Defensive mode."
+            )
+        else:
+            market_columns[1].caption(
+                f"Nifty 50 close {market['close']:,.2f} vs. 200-day SMA {market['sma200']:,.2f} "
+                f"on {market['date']}. Bull mode scales out 50% at +2× ATR, then targets +4× ATR; "
+                "Defensive mode scales out 50% at +1.5× ATR, then targets +3× ATR. After scale-out, "
+                "the remaining stop moves to entry."
+            )
     else:
         st.warning(f"Nifty 50 regime data is unavailable: {market['error']} BUY setups are paused until it loads.")
 
@@ -892,10 +931,11 @@ def main() -> None:
         market_date = pd.to_datetime(market["date"]).strftime("%Y-%m-%d") if market.get("date") else None
         with st.spinner("Loading the Nifty 100 scan and your added stocks…"):
             try:
-                if extra_symbols:
+                if extra_symbols or limited_portfolio_mode:
                     # The scheduled scan contains only the official Nifty 100. Run live
-                    # when personal symbols are present so they enter the same table.
-                    scan_payload = scan_nifty100_cached(extra_symbols)
+                    # for personal symbols and price-ceiling mode so the live filters apply.
+                    price_ceiling = LIMITED_MODE_PRICE_CEILING if limited_portfolio_mode else None
+                    scan_payload = scan_nifty100_cached(extra_symbols, max_price=price_ceiling)
                 else:
                     try:
                         scheduled = download_scheduled_nifty100_scan()
@@ -914,10 +954,17 @@ def main() -> None:
             except Exception as exc:
                 scan_payload = {"results": [], "errors": [], "message": str(exc)[:220]}
         all_scan_results = scan_payload.get("results", [])
-        leaders = [row for row in all_scan_results if row.get("Universe") != "Added"][:10]
-        leader_symbols = {row["Symbol"] for row in leaders}
-        custom_rows = [row for row in all_scan_results if row.get("Universe") == "Added" and row["Symbol"] not in leader_symbols]
-        results = leaders + custom_rows
+        if limited_portfolio_mode:
+            qualified = [row for row in all_scan_results if row.get("Filter status") == "Pass"]
+            qualified.sort(key=lambda row: row.get("Score", -10_000), reverse=True)
+            leaders = qualified[:LIMITED_MODE_TOP_N]
+            custom_rows = []
+            results = leaders
+        else:
+            leaders = [row for row in all_scan_results if row.get("Universe") != "Added"][:10]
+            leader_symbols = {row["Symbol"] for row in leaders}
+            custom_rows = [row for row in all_scan_results if row.get("Universe") == "Added" and row["Symbol"] not in leader_symbols]
+            results = leaders + custom_rows
         errors = scan_payload.get("errors", [])
         if scan_payload.get("compatibility_notice"):
             st.caption(scan_payload["compatibility_notice"])
@@ -939,10 +986,12 @@ def main() -> None:
     if full_list_view and leaderboard_mode:
         all_eligible = [row for row in scan_payload.get("results", []) if row.get("Filter status") == "Pass"]
         all_eligible.sort(key=lambda row: row.get("Score", -10_000), reverse=True)
-        st.subheader("All stocks passing the filters")
+        st.subheader("All stocks passing the limited-mode filters" if limited_portfolio_mode else "All stocks passing the filters")
+        limited_price_note = f" Each stock is below ₹{LIMITED_MODE_PRICE_CEILING:,.0f}." if limited_portfolio_mode else ""
         st.caption(
             f"{len(all_eligible)} stocks · As of {scan_payload.get('as_of', 'unknown')}. "
             "Entry prices below use the latest closing price as a reference; the next session's actual opening price is not known yet."
+            + limited_price_note
         )
         if all_eligible:
             all_display = pd.DataFrame({
@@ -961,7 +1010,12 @@ def main() -> None:
 
     if not results:
         if leaderboard_mode:
-            st.info(scan_payload.get("message") or "No Nifty 100 stocks passed the alignment, RSI, and 200-day SMA filters today. Add a symbol in the sidebar to include it in this table.")
+            default_message = (
+                f"No stocks below ₹{LIMITED_MODE_PRICE_CEILING:,.0f} passed the current filters."
+                if limited_portfolio_mode
+                else "No Nifty 100 stocks passed the alignment, RSI, and 200-day SMA filters today. Add a symbol in the sidebar to include it in this table."
+            )
+            st.info(scan_payload.get("message") or default_message)
             if scan_payload.get("as_of"):
                 st.caption(f"Background or live scan date: {scan_payload['as_of']} · Nifty 100 constituents: {scan_payload.get('constituents', '—')}.")
         else:
@@ -980,23 +1034,41 @@ def main() -> None:
     if leaderboard_mode:
         metric_cols = st.columns(3)
         metric_cols[0].metric("Stocks passing filters", scan_payload.get("eligible_count", len(results)))
-        metric_cols[1].metric("Top 10 leaders", len(leaders))
+        metric_cols[1].metric("Top 3 shown" if limited_portfolio_mode else "Top 10 leaders", len(leaders))
         metric_cols[2].metric("Nifty 50 alignment", scan_payload.get("market_regime", market["name"]))
-        st.subheader("Nifty 100 · Top 10 by Directional Score")
-        st.caption(
-            f"As of {scan_payload.get('as_of', 'unknown')}. Candidates pass the Nifty 50 Bull-regime, stock-above-SMA-200, "
-            "and RSI 40–70 filters. Symbols entered in the sidebar are appended below the leaders and show whether they pass those filters. "
-            "The next session's opening price is unknown until the market opens; starred levels are provisional from the latest close."
-        )
-        display = frame[["Company", "Symbol", "Universe", "Filter status", "Action", "Rating", "Score", "RSI (14)", "Price", "Entry plan", "Stop loss", "Scale-out level", "Target"]].copy()
-        display.insert(0, "Rank", [str(i) if row.get("Universe") != "Added" else "Added" for i, row in enumerate(results, start=1)])
-        display.rename(columns={"Universe": "List", "Price": "Close ref", "Stop loss": "2×ATR stop*", "Scale-out level": "Sell 50%*", "Target": "Final target*"}, inplace=True)
+        if limited_portfolio_mode:
+            st.subheader("Limited Portfolio Growth · Top 3")
+            st.caption(
+                f"As of {scan_payload.get('as_of', 'unknown')}. Up to three highest-scoring stocks pass the Nifty 50 Bull, "
+                f"stock-above-SMA-200, RSI 40–70, and close-below-₹{LIMITED_MODE_PRICE_CEILING:,.0f} filters. "
+                "Entry is next open (TBD); stop and final target are provisional from the latest close. This screen does not size or place trades."
+            )
+            display = frame[["Company", "Symbol", "Action", "Rating", "Score", "Price", "Entry plan", "Stop loss", "Target"]].copy()
+            display.insert(0, "Rank", range(1, len(display) + 1))
+            display.rename(columns={"Price": "Close ref", "Entry plan": "Next-open entry", "Stop loss": "2×ATR stop*", "Target": "Final target*"}, inplace=True)
+        else:
+            st.subheader("Nifty 100 · Top 10 by Directional Score")
+            st.caption(
+                f"As of {scan_payload.get('as_of', 'unknown')}. Candidates pass the Nifty 50 Bull-regime, stock-above-SMA-200, "
+                "and RSI 40–70 filters. Symbols entered in the sidebar are appended below the leaders and show whether they pass those filters. "
+                "The next session's opening price is unknown until the market opens; starred levels are provisional from the latest close."
+            )
+            display = frame[["Company", "Symbol", "Universe", "Filter status", "Action", "Rating", "Score", "RSI (14)", "Price", "Entry plan", "Stop loss", "Scale-out level", "Target"]].copy()
+            display.insert(0, "Rank", [str(i) if row.get("Universe") != "Added" else "Added" for i, row in enumerate(results, start=1)])
+            display.rename(columns={"Universe": "List", "Price": "Close ref", "Stop loss": "2×ATR stop*", "Scale-out level": "Sell 50%*", "Target": "Final target*"}, inplace=True)
         display["Score"] = display["Score"].map(lambda value: f"{value:+d}/100")
-        display["RSI (14)"] = display["RSI (14)"].map(lambda value: f"{value:.1f}")
-        for column in ("Close ref", "2×ATR stop*", "Sell 50%*", "Final target*"):
+        if "RSI (14)" in display:
+            display["RSI (14)"] = display["RSI (14)"].map(lambda value: f"{value:.1f}")
+        money_columns = ["Close ref", "2×ATR stop*", "Final target*"]
+        if not limited_portfolio_mode:
+            money_columns.append("Sell 50%*")
+        for column in money_columns:
             display[column] = display[column].map(money)
         st.dataframe(display, hide_index=True, width="stretch", height=min(520, 46 + 42 * len(display)))
-        st.caption("* Stop, half-off, and target prices use the latest close as a planning reference. They re-anchor to the actual next-open fill; no orders are placed.")
+        if limited_portfolio_mode:
+            st.caption("* The 2×ATR stop and final target use the latest close as planning references; recalculate from the actual next-open fill. No partial exits or orders are placed.")
+        else:
+            st.caption("* Stop, half-off, and target prices use the latest close as a planning reference. They re-anchor to the actual next-open fill; no orders are placed.")
     else:
         metric_cols = st.columns(4)
         for col, label, value in zip(metric_cols, ("BUY setups", "HOLD", "SELL review", "NO ACTION"), (buys, holds, exits, no_action)):
@@ -1030,13 +1102,22 @@ def main() -> None:
         st.write(f"**Why:** {selected['Reason']}")
         st.write(f"**Scanner:** {selected['Paper status']}" if leaderboard_mode else f"**Paper tracking:** {selected['Paper status']}")
         if leaderboard_mode:
-            st.info(
-                f"Next-open entry: not known until the market opens. Latest close reference: {money(selected['Price'])}. "
-                "The following levels are provisional and will need to be recalculated from the actual opening fill."
-            )
-            st.metric("Provisional 2×ATR stop", money(selected["Stop loss"]))
-            st.metric("Provisional sell-50% level", money(selected["Scale-out level"]))
-            st.metric("Provisional final target", money(selected["Target"]))
+            if limited_portfolio_mode:
+                st.info(
+                    f"Next-open entry: TBD. Latest close reference: {money(selected['Price'])}. "
+                    "One provisional 2×ATR stop and one final target are shown; re-anchor both to the actual opening price."
+                )
+                plan_cols = st.columns(2)
+                plan_cols[0].metric("Provisional 2×ATR hard stop", money(selected["Stop loss"]))
+                plan_cols[1].metric("Provisional final target", money(selected["Target"]))
+            else:
+                st.info(
+                    f"Next-open entry: not known until the market opens. Latest close reference: {money(selected['Price'])}. "
+                    "The following levels are provisional and will need to be recalculated from the actual opening fill."
+                )
+                st.metric("Provisional 2×ATR stop", money(selected["Stop loss"]))
+                st.metric("Provisional sell-50% level", money(selected["Scale-out level"]))
+                st.metric("Provisional final target", money(selected["Target"]))
         elif selected["Paper status"].startswith("Active") or selected["Paper status"].startswith("Exit queued"):
             st.write(f"**Paper entry:** {money(selected['Paper entry'])} · **Current stop:** {money(selected['Stop loss'])} · **Fixed target:** {money(selected['Target'])}")
             position = st.session_state.get("paper_positions", {}).get(selected["Symbol"], {})
@@ -1106,11 +1187,13 @@ def main() -> None:
         )
         if owns_stock == "Yes":
             st.caption("Use your actual average entry price and the date you entered. The dashboard only calculates guidance; it cannot see or manage your broker position.")
-            already_scaled = st.checkbox(
-                "I already sold half of this holding",
-                value=False,
-                key=f"scaled_{selected['Symbol']}",
-            )
+            already_scaled = False
+            if not limited_portfolio_mode:
+                already_scaled = st.checkbox(
+                    "I already sold half of this holding",
+                    value=False,
+                    key=f"scaled_{selected['Symbol']}",
+                )
             earliest_entry = pd.Timestamp(selected_history.index[min(ATR_PERIOD, len(selected_history) - 1)]).date()
             latest_entry = pd.Timestamp(selected_history.index[-1]).date()
             entry_date = st.date_input(
@@ -1155,27 +1238,46 @@ def main() -> None:
                 else:
                     target_multiple, scale_multiple = market_risk_parameters(ownership_regime)
                     holding_stop = average_entry - ATR_STOP_MULTIPLE * entry_atr
-                    scale_price = average_entry + scale_multiple * entry_atr
                     holding_target = average_entry + target_multiple * entry_atr
                     current_price = float(selected["Price"])
-                    active_stop = average_entry if already_scaled else holding_stop
                     st.write(f"**Entry-date regime:** {ownership_regime} · **ATR used:** {money(entry_atr)} from {signal_date.strftime('%d %b %Y')}")
-                    st.metric("Current plan stop", money(active_stop))
-                    st.metric("Sell 50% level", "Already done" if already_scaled else money(scale_price))
-                    st.metric("Final target", money(holding_target))
-                    if current_price <= active_stop:
-                        st.error("The estimated stop level has been reached or crossed. Under this plan, exit the remaining holding.")
-                    elif current_price >= holding_target:
-                        st.success("The estimated final target has been reached. Under this plan, sell the remaining shares.")
-                    elif already_scaled:
-                        st.info(f"You marked the first half as sold. Keep the stop on the remaining shares at your entry price ({money(average_entry)}) and target {money(holding_target)}.")
-                    elif current_price >= scale_price:
-                        st.success(f"The estimated half-off level has been reached: the rule says sell 50%, then move the stop on the remaining shares to your entry price ({money(average_entry)}).")
+                    if limited_portfolio_mode:
+                        sessions_held = int(((selected_history.index >= pd.Timestamp(entry_date)) & (selected_history.index <= selected_history.index[-1])).sum())
+                        st.metric("2×ATR hard stop", money(holding_stop))
+                        st.metric("Final target", money(holding_target))
+                        st.caption(f"Holding age: {sessions_held}/{PAPER_TIME_STOP_SESSIONS} trading sessions, counting the entry session.")
+                        if current_price <= holding_stop:
+                            st.error("The estimated hard stop has been reached or crossed. Review the exit under your plan.")
+                        elif current_price >= holding_target:
+                            st.success("The estimated final target has been reached. Review the planned exit.")
+                        elif sessions_held >= PAPER_TIME_STOP_SESSIONS:
+                            st.error("TIME STOP REACHED — the position has reached 12 sessions. The rule calls for an exit at the next market open; the dashboard does not place orders.")
+                        elif sessions_held == PAPER_TIME_STOP_SESSIONS - 1:
+                            st.error("CAPITAL TRAPPED — Day 11 of 12. If the position remains open through the next session close, the time stop calls for an exit at the following market open.")
+                        else:
+                            st.info("No stop, target, or time-stop level has been reached. Recheck the plan at each daily close.")
+                        st.caption("The time-stop count uses available daily candles from the entry date. Stop and target are estimates from pre-entry ATR and exclude costs, taxes, and gaps.")
                     else:
-                        st.info(f"No management level has been reached yet. Hold to the plan; sell half at {money(scale_price)}, move the remaining stop to {money(average_entry)}, and target {money(holding_target)}.")
-                    st.caption("Estimated from the last available ATR and Nifty regime before your entry date; this does not include fees, taxes, dividends, gaps, or any partial sale you may already have made.")
+                        scale_price = average_entry + scale_multiple * entry_atr
+                        active_stop = average_entry if already_scaled else holding_stop
+                        st.metric("Current plan stop", money(active_stop))
+                        st.metric("Sell 50% level", "Already done" if already_scaled else money(scale_price))
+                        st.metric("Final target", money(holding_target))
+                        if current_price <= active_stop:
+                            st.error("The estimated stop level has been reached or crossed. Under this plan, exit the remaining holding.")
+                        elif current_price >= holding_target:
+                            st.success("The estimated final target has been reached. Under this plan, sell the remaining shares.")
+                        elif already_scaled:
+                            st.info(f"You marked the first half as sold. Keep the stop on the remaining shares at your entry price ({money(average_entry)}) and target {money(holding_target)}.")
+                        elif current_price >= scale_price:
+                            st.success(f"The estimated half-off level has been reached: the rule says sell 50%, then move the stop on the remaining shares to your entry price ({money(average_entry)}).")
+                        else:
+                            st.info(f"No management level has been reached yet. Hold to the plan; sell half at {money(scale_price)}, move the remaining stop to {money(average_entry)}, and target {money(holding_target)}.")
+                        st.caption("Estimated from the last available ATR and Nifty regime before your entry date; this does not include fees, taxes, dividends, gaps, or any partial sale you may already have made.")
         elif owns_stock == "No":
-            if selected["Action"] == "BUY":
+            if limited_portfolio_mode:
+                st.write("You marked that you do not own this stock. The displayed plan is a single-entry, single-target reference; no order is placed.")
+            elif selected["Action"] == "BUY":
                 st.info(f"This is a new-entry setup, not a half-off instruction. If you choose to enter, the current illustration says sell 50% near {money(selected['Price'] + selected['Scale-out ATR multiple'] * selected['ATR (14)'])} and move the remaining stop to entry.")
             else:
                 st.write("You marked that you do not own this stock. There is no holding to scale out of; use the BUY/SELL rating as a research signal only.")
@@ -1199,6 +1301,23 @@ def main() -> None:
         show_bollinger = overlay_columns[3].checkbox("Bollinger", value=False)
         chart_figure = make_candlestick_chart(chart, show_sma20, show_sma50, show_sma200, show_bollinger)
         st.plotly_chart(chart_figure, width="stretch", config={"displaylogo": False})
+
+    if limited_portfolio_mode:
+        with st.expander("Limited Portfolio Growth rules"):
+            st.markdown(
+                f"The dashboard shows up to {LIMITED_MODE_TOP_N} highest-scoring Nifty 100 stocks that pass the Nifty 50 Bull-regime, "
+                f"stock-above-SMA-200, RSI 40–70, and close-below-₹{LIMITED_MODE_PRICE_CEILING:,.0f} filters. "
+                "The plan has one next-open entry reference, a fixed 2×ATR stop, and one final target: 4×ATR in Bull regime or 3×ATR in Defensive regime. "
+                "It does not display partial-exit prompts, calculate share quantity, allocate a fixed ₹50,000, or place orders. "
+                f"In **Your position**, the {PAPER_TIME_STOP_SESSIONS}-session count includes the entry session; Day 11 shows a red CAPITAL TRAPPED warning, "
+                "and after the 12th session close the time-stop rule calls for an exit at the next market open. "
+                "All displayed entry and risk prices are provisional references from daily data; actual fills, fees, taxes, and gaps can differ."
+            )
+        if errors:
+            with st.expander(f"Data issues ({len(errors)} symbols)"):
+                st.dataframe(pd.DataFrame(errors), hide_index=True, width="stretch")
+        st.caption(f"Last dashboard refresh: {datetime.now().astimezone().strftime('%d %b %Y, %H:%M %Z')} · For research and education; no trades are placed.")
+        return
 
     with st.expander("Paper trade log"):
         active_positions = st.session_state.get("paper_positions", {})
