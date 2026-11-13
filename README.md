@@ -55,11 +55,41 @@ Use **View all passing stocks** in the top-right corner to open a separate tab w
 
 The scoring references are set to P/E 80, preferred 1-year Sharpe 0.5, and preferred maximum drawdown 40%. These factors affect the Directional Score; they are not hard exclusion filters. The explicit eligibility filters remain the Nifty 50 regime, price above SMA 200, and RSI 40–70.
 
-The sidebar **Account Size** radio offers **Standard** and **Under ₹2L**. Standard keeps the Top 10 screen and its existing scale-out plan. Under ₹2L activates **Limited Portfolio Growth**: it runs a live scan, excludes closes of ₹1,000 or more before ranking, and shows at most the three highest-scoring stocks that pass the regular eligibility filters. Its single-target plan uses a fixed 2 × ATR stop and one final target (4 × ATR in Bull regime, 3 × ATR in Defensive regime); it hides all partial-exit prompts. Set the per-stock budget in the sidebar (default ₹16,500). For each Top 3 row, **Shares to Buy** is the budget divided by the latest close and rounded down to a whole share; **Cash Required** is that quantity times the close. This is an estimate from the previous close, not an order or a guarantee of what the next-open price will cost. Three default budgets total ₹49,500 before brokerage charges, taxes, and other costs.
+The sidebar **Account Size** radio offers **Standard** and **Under ₹2L**. Standard keeps the Top 10 screen and its existing scale-out plan. Under ₹2L activates **Limited Portfolio Growth**: it runs a live scan, excludes closes of ₹1,000 or more before ranking, and shows at most the three highest-scoring stocks that pass the regular eligibility filters. Its whole-position bracket uses a fixed 2 × ATR stop and one +3 × ATR target in every market regime; there is no trailing stop or partial-exit prompt. Set the per-stock budget in the sidebar (default ₹16,500). For each Top 3 row, **Shares to Buy** is the budget divided by the latest unadjusted close and rounded down to a whole share; **Cash Required** is that quantity times the close. This is an estimate from the previous close, not an order or a guarantee of what the next-open price will cost. Three default budgets total ₹49,500 before brokerage charges, taxes, and other costs. The rupee gain or loss at either bracket level varies with that stock's ATR and price; ₹900 / ₹1,350–₹1,500 are not fixed outcomes.
 
-The dashboard has two tabs: **Screener** and **Active Portfolio**. After a broker fill, enter each holding's ticker, actual entry price, and entry date in the editable portfolio ledger. The app fetches raw daily OHLCV, anchors ATR to the last available candle before the entry date, fixes the stop at entry price − 2 × ATR, and fixes the final target at entry price + 4 × ATR for Bull regime or +3 × ATR for Defensive regime on the entry date. It counts available trading sessions from the entry date and shows the latest close, levels, and a color-coded next-open command: HOLD, TARGET HIT, STOP HIT, or TIME STOP. A time stop applies after the 12th session close. If one daily candle touches both stop and target, the stop is assumed to have triggered first. Review gaps, fills, and the data date with your broker; the app cannot verify or act on orders.
+The dashboard has two tabs: **Screener** and **Active Portfolio**. After a broker fill, enter each holding's ticker, actual entry price, and entry date in the editable portfolio ledger. The app fetches raw daily OHLCV, anchors ATR to the last available candle before the entry date, fixes the stop at entry price − 2 × ATR, and fixes the final target at entry price + 3 × ATR. There is no trailing stop or scale-out in the Active Portfolio bracket. It counts available trading sessions from the entry date and shows the latest close, levels, and a color-coded next-open command: HOLD, TARGET HIT, STOP HIT, or TIME STOP. A time stop applies after the 12th session close. If one daily candle touches both stop and target, the stop is assumed to have triggered first. Review gaps, fills, and the data date with your broker; the app cannot verify or act on orders.
 
-The ledger exists in the current browser session. Use **Download ledger backup** and **Load a saved portfolio CSV** to keep it between sessions or devices. The file is not stored in the public app for you and is not shared with other users. The alert is a research prompt; the app cannot see your brokerage account or submit an entry or exit.
+The **Screener** can remain public. **Active Portfolio** uses sign-in so each user loads only their own saved holdings. Once configured, edits and row deletions save automatically to that account's file in a private GitHub Gist. Delete a ledger row when you close the holding or no longer want it tracked. The scheduled weekday job refreshes action prompts after the market close; opening the app also fetches current daily data. A guest can use a temporary session ledger and download/load a CSV, but it will not persist automatically.
+
+### One-time setup for private, per-user portfolios
+
+The account-saving feature needs an identity provider plus a private Gist. Without these secrets, the app intentionally keeps the holdings ledger temporary rather than putting every visitor's entries in a shared public location.
+
+1. In Google Cloud Console, create an OAuth client for a web application. Add the dashboard's OAuth callback as an authorized redirect URI:
+
+   ```text
+   https://quanttrading-fx3ke8zatpr5mjzzntdddu.streamlit.app/oauth2callback
+   ```
+
+2. Create a **private** GitHub Gist with any starter file, such as `portfolio-store.json`, and copy the Gist ID from its URL. Create a fine-grained GitHub token with **Gists: read and write** permission.
+
+3. In Streamlit Community Cloud, open the app's **Settings → Secrets** and add the following TOML, replacing the values with your credentials. Generate a long random `cookie_secret` and keep these secrets out of GitHub source files.
+
+   ```toml
+   PORTFOLIO_GITHUB_TOKEN = "your_github_token"
+   PORTFOLIO_GIST_ID = "your_private_gist_id"
+
+   [auth]
+   redirect_uri = "https://quanttrading-fx3ke8zatpr5mjzzntdddu.streamlit.app/oauth2callback"
+   cookie_secret = "a_long_random_secret"
+   client_id = "your_google_oauth_client_id"
+   client_secret = "your_google_oauth_client_secret"
+   server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
+   ```
+
+4. In the GitHub repository, open **Settings → Secrets and variables → Actions** and add the same `PORTFOLIO_GITHUB_TOKEN` and `PORTFOLIO_GIST_ID` names. This lets the scheduled job update private positions without writing any portfolio data into the public repository.
+
+When users sign in, the app hashes the identity provider's account ID and stores that user's ledger in a separate private Gist file. Other signed-in users can access their own file only through the app. Streamlit supports OIDC sign-in and stores secrets in app settings; GitHub's Gist API supports fine-grained tokens with Gists write permission. See [Streamlit authentication](https://docs.streamlit.io/develop/concepts/connections/authentication), [Streamlit Community Cloud secrets](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management), and [GitHub Gists API permissions](https://docs.github.com/en/rest/gists/gists).
 
 ### Roll back to the original scanner
 
@@ -132,3 +162,4 @@ This is a technical screening example for research and education. The Nifty 100 
 - **Update 5:** Adds a 50% scale-out at +2 × ATR in Bull mode or +1.5 × ATR in Defensive mode; the remaining stop moves to entry, with final targets of +4 × ATR / +3 × ATR. Adds a 12-session time stop that queues exit for the next open, plus an ownership panel that estimates management levels from the user's entered average price and entry date.
 - **Update 6:** Makes a Nifty 100 Top 10 leaderboard the main scanner. It filters for Nifty 50 Bull alignment, close above each stock's SMA 200, and RSI 40–70; ranks by the existing Directional Score; and adds a weekday 16:30 IST GitHub Actions scan. Tomorrow's open is shown as TBD, with close-based provisional stop/scale-out/target prices. Set `SCAN_UNIVERSE = "WATCHLIST"` to restore the previous scanner.
 - **Update 7:** Adds a sidebar account-size choice. Under ₹2L activates Limited Portfolio Growth: Top 3 eligible stocks with close below ₹1,000, one 2 × ATR stop and one regime-based final target, plus a Day 11 capital-velocity warning and the existing 12-session exit rule. Standard mode preserves the earlier Top 10 and scale-out behavior.
+- **Update 8:** Changes the Limited Portfolio Growth plan to a fixed whole-position 2 × ATR stop and 3 × ATR target, with no trailing or partial exits. Adds an editable Active Portfolio ledger with 12-session HOLD/STOP/TARGET/TIME STOP commands, per-user sign-in and private Gist persistence, and weekday after-close portfolio checks. Per-user saving requires the one-time private-storage setup above.
