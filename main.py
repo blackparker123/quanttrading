@@ -267,8 +267,9 @@ def evaluate_active_holding(ticker: str, entry_price: float, entry_date) -> dict
     history = add_indicators(download_history(symbol, auto_adjust=False))
     latest = history.iloc[-1]
     latest_date = pd.Timestamp(history.index[-1]).normalize()
-    if entry_ts > latest_date:
-        raise ValueError("Entry date is after the latest available daily candle.")
+    today = pd.Timestamp.now(tz="Asia/Kolkata").normalize().tz_localize(None)
+    if entry_ts > today:
+        raise ValueError("Entry date cannot be in the future.")
 
     pre_entry = history.loc[history.index.normalize() < entry_ts]
     if pre_entry.empty or pd.isna(pre_entry.iloc[-1]["ATR"]):
@@ -365,157 +366,132 @@ def render_active_portfolio() -> None:
     st.subheader("Active Portfolio")
     if os.environ.get("QUANTTRADING_LOCAL_PORTFOLIO") != "1":
         st.info(
-            "Active Portfolio is private to the copy running on your computer. This public link never loads or saves portfolio entries. "
-            "Open the project in VS Code and run the local-dashboard command in the README."
+            "Active Portfolio is available only in the copy running on your computer. "
+            "This public link never loads or saves portfolio entries."
         )
         return
 
     st.caption(
-        "After your broker confirms a fill, enter the ticker, actual entry price, and entry date below. "
-        "This ledger saves automatically to a private file in this project folder on this computer. "
-        "Delete a ledger row when you close or stop tracking that position."
+        "Enter your ticker, actual filled price, and buy date, then press Add to portfolio. "
+        "The row is saved on this computer immediately. Use Remove to stop tracking a position."
     )
-    ledger_columns = ["Ticker", "Entry Price", "Entry Date"]
-    if "active_portfolio_ledger" not in st.session_state:
+    if "active_portfolio_positions" not in st.session_state:
         try:
             payload = load_portfolio()
         except Exception as exc:
             st.error(f"Could not load the local portfolio: {str(exc)[:180]}")
             return
-        positions = pd.DataFrame(payload.get("positions", []), columns=ledger_columns)
-        if not positions.empty:
-            positions["Entry Price"] = pd.to_numeric(positions["Entry Price"], errors="coerce")
-            positions["Entry Date"] = pd.to_datetime(positions["Entry Date"], errors="coerce").dt.date
-        st.session_state["active_portfolio_ledger"] = positions
         st.session_state["active_portfolio_payload"] = payload
-        st.session_state["active_portfolio_signature"] = json.dumps(payload.get("positions", []), sort_keys=True)
+        st.session_state["active_portfolio_positions"] = list(payload.get("positions", []))
 
-    edited_ledger = st.data_editor(
-        st.session_state["active_portfolio_ledger"],
-        num_rows="dynamic",
-        hide_index=True,
-        width="stretch",
-        key="active_portfolio_editor",
-        column_config={
-            "Ticker": st.column_config.TextColumn("Ticker (e.g. PNB or PNB.NS)"),
-            "Entry Price": st.column_config.NumberColumn("Entry Price (₹)", min_value=0.01, step=0.05, format="₹%.2f"),
-            "Entry Date": st.column_config.DateColumn("Entry Date", format="DD MMM YYYY"),
-        },
-    )
-    # Keep the editor's original data as its base. Streamlit stores edits as a
-    # widget diff; replacing the base with the already-edited result can apply
-    # the diff twice on the next rerun and make rows/cells disappear.
-    positions_payload = _ledger_positions(edited_ledger)
-    positions_signature = json.dumps(positions_payload, sort_keys=True)
-    saved_signature = st.session_state.get("active_portfolio_signature")
-    storage_payload = st.session_state.get("active_portfolio_payload")
-    if storage_payload is not None and positions_signature != saved_signature:
-        updated_payload = dict(storage_payload)
-        updated_payload["positions"] = positions_payload
+    with st.form("add_active_position", clear_on_submit=True):
+        entry_columns = st.columns([1.2, 1, 1])
+        ticker = entry_columns[0].text_input("Ticker", placeholder="PNB.NS or PNB")
+        entry_price = entry_columns[1].number_input("Filled buy price (₹)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
+        entry_date = entry_columns[2].date_input("Buy date", value=datetime.now().date())
+        add_position = st.form_submit_button("Add to portfolio", type="primary", width="stretch")
+
+    if add_position:
+        if not ticker.strip() or entry_price <= 0:
+            st.error("Enter a ticker and your actual filled buy price. Then add the position again.")
+        else:
+            symbol = ticker.strip().upper()
+            if "." not in symbol:
+                symbol += ".NS"
+            positions = list(st.session_state["active_portfolio_positions"])
+            positions.append({
+                "Ticker": symbol,
+                "Entry Price": float(entry_price),
+                "Entry Date": entry_date.isoformat(),
+            })
+            payload = dict(st.session_state["active_portfolio_payload"])
+            payload["positions"] = positions
+            try:
+                save_portfolio(payload)
+                st.session_state["active_portfolio_payload"] = payload
+                st.session_state["active_portfolio_positions"] = positions
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save the position on this computer: {str(exc)[:180]}")
+
+    stored_positions = st.session_state["active_portfolio_positions"]
+    if not stored_positions:
+        st.info("No active positions yet. Add a filled stock above to calculate its stop, target, and next move.")
+        return
+
+    results = []
+    for index, position in enumerate(stored_positions):
+        ticker = str(position.get("Ticker", "")).strip()
+        entry_price = pd.to_numeric(position.get("Entry Price"), errors="coerce")
+        entry_date = position.get("Entry Date")
         try:
-            save_portfolio(updated_payload)
-            st.session_state["active_portfolio_payload"] = updated_payload
-            st.session_state["active_portfolio_signature"] = positions_signature
-            storage_payload = updated_payload
+            if not ticker or pd.isna(entry_price) or float(entry_price) <= 0 or not entry_date:
+                raise ValueError("Position needs a ticker, filled buy price, and buy date.")
+            result = evaluate_active_holding(ticker, float(entry_price), entry_date)
+            result["Row"] = index
+            results.append(result)
         except Exception as exc:
-            st.error(f"Your edit is on screen but could not be saved locally: {str(exc)[:180]}")
-    if storage_payload is not None:
-        last_checked = storage_payload.get("last_checked")
-        checked_text = f"Last local background check: {last_checked}" if last_checked else "Current prices and action prompts refresh when this tab opens."
-        st.caption(f"✅ Saved on this computer. {checked_text}")
-
-    rows = []
-    for _, item in edited_ledger.iterrows():
-        ticker = str(item.get("Ticker", "")).strip()
-        entry_price = pd.to_numeric(item.get("Entry Price"), errors="coerce")
-        entry_date = item.get("Entry Date")
-        if not ticker and pd.isna(entry_price) and pd.isna(entry_date):
-            continue
-        if not ticker or pd.isna(entry_price) or float(entry_price) <= 0 or pd.isna(entry_date):
-            rows.append({
+            results.append({
+                "Row": index,
                 "Ticker": ticker or "—",
                 "Entry Price": None if pd.isna(entry_price) else float(entry_price),
                 "Entry Date": entry_date,
                 "Current Close": None,
-                "Hard Stop": None,
-                "Final Target": None,
-                "Regime at Entry": "—",
-                "Sessions": "—",
-                "Status": "NEEDS INPUT",
-                "Tomorrow's Action": "⚪ NEEDS INPUT — Complete ticker, entry price, and entry date.",
-            })
-            continue
-        try:
-            rows.append(evaluate_active_holding(ticker, float(entry_price), entry_date))
-        except Exception as exc:
-            normalized_ticker = ticker.upper()
-            if "." not in normalized_ticker:
-                normalized_ticker += ".NS"
-            rows.append({
-                "Ticker": normalized_ticker,
-                "Entry Price": float(entry_price),
-                "Entry Date": pd.Timestamp(entry_date).date(),
-                "Current Close": None,
                 "As of": None,
-                "Entry ATR": None,
-                "Regime at Entry": "—",
                 "Hard Stop": None,
                 "Final Target": None,
+                "Regime at Entry": "—",
                 "Sessions": "—",
                 "Status": "NEEDS DATA",
                 "Tomorrow's Action": f"⚪ NEEDS DATA — {str(exc)[:150]}",
             })
 
-    if rows:
-        result = pd.DataFrame(rows)
-        result_columns = ["Ticker", "Entry Price", "Entry Date", "Current Close", "As of", "Hard Stop", "Final Target", "Regime at Entry", "Sessions", "Status", "Tomorrow's Action"]
-        table = result.reindex(columns=result_columns).copy()
-        for column in ("Entry Price", "Current Close", "Hard Stop", "Final Target"):
-            table[column] = table[column].map(money)
-        status_colors = {
-            "HOLD": "#e7f5e9",
-            "TARGET HIT": "#fff2cc",
-            "STOP HIT": "#fde2e2",
-            "TIME STOP": "#f7d9e3",
-            "NEEDS INPUT": "#eeeeee",
-            "NEEDS DATA": "#eeeeee",
-        }
-        styled = table.style.apply(
-            lambda row: [
-                f"background-color: {status_colors.get(row['Status'], '#ffffff')}; font-weight: 600;" if column == "Tomorrow's Action" else ""
-                for column in row.index
-            ],
-            axis=1,
-        )
-        st.dataframe(styled, hide_index=True, width="stretch", height=min(620, 46 + 44 * len(table)))
-        stock_choices = {
-            f"{row['Ticker']} · {row['Status']}": index
-            for index, row in result.iterrows()
-        }
-        selected_choice = st.selectbox("Choose a stock to see what to do next", list(stock_choices), key="active_portfolio_next_move")
-        selected_row = result.loc[stock_choices[selected_choice]]
-        st.markdown(f"#### {selected_row['Ticker']} — {selected_row['Status']}")
-        command = selected_row["Tomorrow's Action"]
-        if selected_row["Status"] == "HOLD":
-            st.success(command)
-        elif selected_row["Status"] in ("TARGET HIT", "STOP HIT", "TIME STOP"):
-            st.error(command)
+    st.subheader("Your positions")
+    for position in results:
+        header, remove_column = st.columns([6, 1])
+        header.markdown(f"**{position['Ticker']}** · {position['Status']}")
+        if remove_column.button("Remove", key=f"remove_active_position_{position['Row']}"):
+            positions = list(stored_positions)
+            positions.pop(position["Row"])
+            payload = dict(st.session_state["active_portfolio_payload"])
+            payload["positions"] = positions
+            try:
+                save_portfolio(payload)
+                st.session_state["active_portfolio_payload"] = payload
+                st.session_state["active_portfolio_positions"] = positions
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not remove the position from this computer: {str(exc)[:180]}")
+        if position["Status"] == "HOLD":
+            st.success(position["Tomorrow's Action"])
+        elif position["Status"] in ("STOP HIT", "TARGET HIT", "TIME STOP"):
+            st.error(position["Tomorrow's Action"])
         else:
-            st.warning(command)
-        if pd.notna(selected_row.get("Current Close")):
-            st.caption(
-                f"Entry {money(selected_row['Entry Price'])} · Current close {money(selected_row['Current Close'])} "
-                f"· Stop {money(selected_row['Hard Stop'])} · Target {money(selected_row['Final Target'])} "
-                f"· Session {selected_row['Sessions']}/{PAPER_TIME_STOP_SESSIONS} · Data through {selected_row['As of']}"
-            )
+            st.warning(position["Tomorrow's Action"])
+        if position.get("Current Close") is not None:
+            detail = st.columns(5)
+            detail[0].metric("Entry", money(position["Entry Price"]))
+            detail[1].metric("Current close", money(position["Current Close"]))
+            detail[2].metric("2×ATR stop", money(position["Hard Stop"]))
+            detail[3].metric("3×ATR target", money(position["Final Target"]))
+            detail[4].metric("Sessions", f"{position['Sessions']}/{PAPER_TIME_STOP_SESSIONS}")
+            st.caption(f"Daily data through {position['As of']} · Regime at entry: {position['Regime at Entry']}")
+        st.divider()
+
+    choices = [f"{row['Ticker']} · {row['Status']} · position {row['Row'] + 1}" for row in results]
+    selected_label = st.selectbox("Choose a stock for its next-move summary", choices, key="active_portfolio_stock_choice")
+    selected_position = results[choices.index(selected_label)]
+    st.markdown(f"### Next move for {selected_position['Ticker']}")
+    if selected_position["Status"] == "HOLD":
+        st.success(selected_position["Tomorrow's Action"])
+    elif selected_position["Status"] in ("STOP HIT", "TARGET HIT", "TIME STOP"):
+        st.error(selected_position["Tomorrow's Action"])
     else:
-        st.info("Add the ticker, your filled entry price, and entry date. The dashboard calculates its stop, target, and next action as soon as all three are entered.")
-
+        st.warning(selected_position["Tomorrow's Action"])
     st.caption(
-        "Stops and targets use the entry price plus ATR from the last available candle before entry; regime is also fixed from that date. "
-        "A daily candle touching both stop and target is treated as a stop first. Gaps, liquidity, and broker execution can differ; verify orders in your broker."
+        "A stock entered before today's close gets its stop and target immediately from the prior daily ATR; its current close and session count update when today's candle is available. "
+        "The app does not place or verify broker orders."
     )
-
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def download_pe(symbol: str) -> float | None:
