@@ -6,6 +6,7 @@ from datetime import datetime
 import inspect
 import json
 import math
+import os
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -15,7 +16,7 @@ import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
 from nifty100_engine import scan_nifty100
-from portfolio_storage import load_user_portfolio, save_user_portfolio
+from portfolio_storage import load_portfolio, save_portfolio
 
 
 # Edit this list to scan other Yahoo Finance symbols. NSE symbols end in .NS.
@@ -338,14 +339,6 @@ def evaluate_active_holding(ticker: str, entry_price: float, entry_date) -> dict
     }
 
 
-def _app_secret(name: str) -> str:
-    try:
-        value = st.secrets.get(name, "")
-    except Exception:
-        value = ""
-    return str(value).strip()
-
-
 def _ledger_positions(frame: pd.DataFrame) -> list[dict]:
     """Serialize only the three user-entered fields; derive all other fields."""
     positions = []
@@ -368,101 +361,34 @@ def _ledger_positions(frame: pd.DataFrame) -> list[dict]:
 
 
 def render_active_portfolio() -> None:
-    """Track a user's own ledger and show entry-anchored bracket commands."""
+    """Track positions from an ignored JSON file on this computer."""
     st.subheader("Active Portfolio")
+    if os.environ.get("QUANTTRADING_LOCAL_PORTFOLIO") != "1":
+        st.info(
+            "Active Portfolio is private to the copy running on your computer. This public link never loads or saves portfolio entries. "
+            "Open the project in VS Code and run the local-dashboard command in the README."
+        )
+        return
+
     st.caption(
         "After your broker confirms a fill, enter the ticker, actual entry price, and entry date below. "
-        "The dashboard fetches daily closes, calculates the fixed 2×ATR stop and 3×ATR target, and tracks the 12-session exit rule. "
+        "This ledger saves automatically to a private file in this project folder on this computer. "
         "Delete a ledger row when you close or stop tracking that position."
     )
-
     ledger_columns = ["Ticker", "Entry Price", "Entry Date"]
-    auth_ready = False
-    logged_in = False
-    subject = ""
-    try:
-        auth_ready = bool(st.secrets.get("auth", {}).get("client_id"))
-        logged_in = bool(st.user.is_logged_in) if auth_ready else False
-        subject = str(st.user.get("sub", "")).strip() if logged_in else ""
-    except Exception:
-        auth_ready = False
-        logged_in = False
-        subject = ""
-
-    if auth_ready and not logged_in:
-        st.info("Sign in to load and save your own portfolio. Each account has a separate private ledger.")
-        if st.button("Sign in", key="portfolio_sign_in"):
-            st.login()
-        st.caption("You can still use this tab as a temporary guest ledger and download a CSV backup.")
-    elif logged_in:
-        account_email = st.user.get("email", "signed-in account")
-        account_left, account_right = st.columns([5, 1])
-        account_left.caption(f"Signed in: {account_email} · Your portfolio is isolated from other accounts.")
-        if account_right.button("Log out", key="portfolio_sign_out"):
-            st.logout()
-    else:
-        st.warning("Per-account saving is not configured yet. This public app keeps guest entries only in the current browser session; use the CSV backup to keep them.")
-
-    gist_token = _app_secret("PORTFOLIO_GITHUB_TOKEN")
-    gist_id = _app_secret("PORTFOLIO_GIST_ID")
-    remote_ready = bool(logged_in and subject and gist_token and gist_id)
-    current_user_key = subject if remote_ready else "guest-session"
-    previous_user_key = st.session_state.get("active_portfolio_user_key")
-    if previous_user_key != current_user_key:
-        st.session_state.pop("active_portfolio_editor", None)
-        st.session_state.pop("active_portfolio_ledger", None)
-        st.session_state.pop("active_portfolio_payload", None)
-        st.session_state.pop("active_portfolio_signature", None)
-        st.session_state["active_portfolio_user_key"] = current_user_key
-
-        if remote_ready:
-            try:
-                payload = load_user_portfolio(gist_token, gist_id, subject)
-                positions = pd.DataFrame(payload.get("positions", []), columns=ledger_columns)
-                if not positions.empty:
-                    positions["Entry Price"] = pd.to_numeric(positions["Entry Price"], errors="coerce")
-                    positions["Entry Date"] = pd.to_datetime(positions["Entry Date"], errors="coerce").dt.date
-                st.session_state["active_portfolio_ledger"] = positions
-                st.session_state["active_portfolio_payload"] = payload
-                st.session_state["active_portfolio_signature"] = json.dumps(payload.get("positions", []), sort_keys=True)
-                st.session_state["active_portfolio_storage_error"] = None
-            except Exception as exc:
-                st.session_state["active_portfolio_ledger"] = pd.DataFrame(columns=ledger_columns)
-                st.session_state["active_portfolio_payload"] = None
-                st.session_state["active_portfolio_storage_error"] = str(exc)[:200]
-        else:
-            st.session_state["active_portfolio_ledger"] = pd.DataFrame(columns=ledger_columns)
-            st.session_state["active_portfolio_payload"] = None
-            st.session_state["active_portfolio_storage_error"] = None
-
-    storage_error = st.session_state.get("active_portfolio_storage_error")
-    if remote_ready and storage_error:
-        st.error(f"Could not load your private portfolio: {storage_error}")
-    elif logged_in and not (gist_token and gist_id):
-        st.warning("Automatic saving is not configured. Add the private GitHub Gist credentials to the app's secrets; until then, use the CSV backup.")
-
     if "active_portfolio_ledger" not in st.session_state:
-        st.session_state["active_portfolio_ledger"] = pd.DataFrame(columns=ledger_columns)
-
-    with st.expander("Load a saved portfolio CSV"):
-        uploaded = st.file_uploader("Choose a ledger backup", type=["csv"], key="portfolio_ledger_upload")
-        if st.button("Load ledger", key="load_portfolio_ledger"):
-            if uploaded is None:
-                st.warning("Choose a CSV file first.")
-            else:
-                try:
-                    incoming = pd.read_csv(uploaded)
-                    missing = [column for column in ledger_columns if column not in incoming.columns]
-                    if missing:
-                        raise ValueError(f"CSV is missing required column(s): {', '.join(missing)}.")
-                    incoming = incoming[ledger_columns].copy()
-                    incoming["Entry Price"] = pd.to_numeric(incoming["Entry Price"], errors="coerce")
-                    incoming["Entry Date"] = pd.to_datetime(incoming["Entry Date"], errors="coerce").dt.date
-                    st.session_state["active_portfolio_ledger"] = incoming
-                    st.session_state.pop("active_portfolio_editor", None)
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Could not load this ledger: {str(exc)[:180]}")
+        try:
+            payload = load_portfolio()
+        except Exception as exc:
+            st.error(f"Could not load the local portfolio: {str(exc)[:180]}")
+            return
+        positions = pd.DataFrame(payload.get("positions", []), columns=ledger_columns)
+        if not positions.empty:
+            positions["Entry Price"] = pd.to_numeric(positions["Entry Price"], errors="coerce")
+            positions["Entry Date"] = pd.to_datetime(positions["Entry Date"], errors="coerce").dt.date
+        st.session_state["active_portfolio_ledger"] = positions
+        st.session_state["active_portfolio_payload"] = payload
+        st.session_state["active_portfolio_signature"] = json.dumps(payload.get("positions", []), sort_keys=True)
 
     edited_ledger = st.data_editor(
         st.session_state["active_portfolio_ledger"],
@@ -481,31 +407,20 @@ def render_active_portfolio() -> None:
     positions_signature = json.dumps(positions_payload, sort_keys=True)
     saved_signature = st.session_state.get("active_portfolio_signature")
     storage_payload = st.session_state.get("active_portfolio_payload")
-    if remote_ready and not storage_error and storage_payload is not None and positions_signature != saved_signature:
+    if storage_payload is not None and positions_signature != saved_signature:
         updated_payload = dict(storage_payload)
         updated_payload["positions"] = positions_payload
         try:
-            save_user_portfolio(gist_token, gist_id, subject, updated_payload)
+            save_portfolio(updated_payload)
             st.session_state["active_portfolio_payload"] = updated_payload
             st.session_state["active_portfolio_signature"] = positions_signature
-            st.session_state["active_portfolio_storage_error"] = None
             storage_payload = updated_payload
         except Exception as exc:
-            storage_error = str(exc)[:200]
-            st.session_state["active_portfolio_storage_error"] = storage_error
-            st.error(f"Your edit is on screen but could not be saved: {storage_error}")
-    if remote_ready and storage_payload is not None and not storage_error:
+            st.error(f"Your edit is on screen but could not be saved locally: {str(exc)[:180]}")
+    if storage_payload is not None:
         last_checked = storage_payload.get("last_checked")
-        checked_text = f"Background check: {last_checked}" if last_checked else "Background check will run after the next scheduled market close."
-        st.caption(f"✅ Your changes save automatically to your private account. {checked_text}")
-
-    st.download_button(
-        "Download ledger backup",
-        data=edited_ledger.to_csv(index=False).encode("utf-8"),
-        file_name="quanttrading_portfolio.csv",
-        mime="text/csv",
-        key="download_portfolio_ledger",
-    )
+        checked_text = f"Last local background check: {last_checked}" if last_checked else "Current prices and action prompts refresh when this tab opens."
+        st.caption(f"✅ Saved on this computer. {checked_text}")
 
     rows = []
     for _, item in edited_ledger.iterrows():
@@ -1541,110 +1456,6 @@ def main() -> None:
                 st.write(f"**Illustrative {selected['Scenario'].lower()} target:** {money(selected['Target'])}")
                 st.caption("These are ATR-based scenario levels for comparison; HOLD / NO ACTION does not mean you should enter a position.")
 
-            st.subheader("Your position")
-            owns_stock = st.selectbox(
-                "Do you currently own this stock?",
-                ("Choose one", "Yes", "No"),
-                key=f"owns_{selected['Symbol']}",
-                help="Answer for your real account. The dashboard does not read or change your brokerage holdings.",
-            )
-            if owns_stock == "Yes":
-                st.caption("Use your actual average entry price and the date you entered. The dashboard only calculates guidance; it cannot see or manage your broker position.")
-                already_scaled = False
-                if not limited_portfolio_mode:
-                    already_scaled = st.checkbox(
-                        "I already sold half of this holding",
-                        value=False,
-                        key=f"scaled_{selected['Symbol']}",
-                    )
-                earliest_entry = pd.Timestamp(selected_history.index[min(ATR_PERIOD, len(selected_history) - 1)]).date()
-                latest_entry = pd.Timestamp(selected_history.index[-1]).date()
-                entry_date = st.date_input(
-                    "Date you entered",
-                    value=latest_entry,
-                    min_value=earliest_entry,
-                    max_value=latest_entry,
-                    key=f"holding_date_{selected['Symbol']}",
-                )
-                average_entry = st.number_input(
-                    "Your average entry price (₹)",
-                    min_value=0.01,
-                    value=max(float(selected["Price"]), 0.01),
-                    step=1.0,
-                    key=f"holding_entry_{selected['Symbol']}",
-                )
-                prior_stock_bars = selected_history.loc[selected_history.index < pd.Timestamp(entry_date)]
-                if prior_stock_bars.empty or pd.isna(prior_stock_bars.iloc[-1]["ATR"]):
-                    st.warning("There is not enough price history before that entry date to estimate ATR-based management levels.")
-                else:
-                    entry_atr = float(prior_stock_bars.iloc[-1]["ATR"])
-                    signal_date = pd.Timestamp(prior_stock_bars.index[-1])
-                    try:
-                        nifty = download_nifty_close()
-                        nifty_sma200 = nifty.rolling(200, min_periods=200).mean()
-                        eligible_nifty = nifty.loc[nifty.index <= signal_date]
-                    except Exception:
-                        eligible_nifty = pd.Series(dtype=float)
-                        nifty_sma200 = pd.Series(dtype=float)
-                    if eligible_nifty.empty:
-                        ownership_regime = "Unavailable"
-                    else:
-                        regime_date = eligible_nifty.index[-1]
-                        regime_sma = nifty_sma200.loc[regime_date]
-                        ownership_regime = (
-                            "Unavailable" if pd.isna(regime_sma)
-                            else "Bull" if eligible_nifty.iloc[-1] > regime_sma
-                            else "Defensive"
-                        )
-                    if ownership_regime == "Unavailable":
-                        st.warning("Nifty regime history is unavailable for that entry date, so the management levels cannot be selected reliably.")
-                    else:
-                        target_multiple = LIMITED_MODE_TARGET_ATR if limited_portfolio_mode else market_risk_parameters(ownership_regime)[0]
-                        scale_multiple = market_risk_parameters(ownership_regime)[1]
-                        holding_stop = average_entry - ATR_STOP_MULTIPLE * entry_atr
-                        holding_target = average_entry + target_multiple * entry_atr
-                        current_price = float(selected["Price"])
-                        st.write(f"**Entry-date regime:** {ownership_regime} · **ATR used:** {money(entry_atr)} from {signal_date.strftime('%d %b %Y')}")
-                        if limited_portfolio_mode:
-                            sessions_held = int(((selected_history.index >= pd.Timestamp(entry_date)) & (selected_history.index <= selected_history.index[-1])).sum())
-                            st.metric("2×ATR hard stop", money(holding_stop))
-                            st.metric("Final target", money(holding_target))
-                            st.caption(f"Holding age: {sessions_held}/{PAPER_TIME_STOP_SESSIONS} trading sessions, counting the entry session.")
-                            if current_price <= holding_stop:
-                                st.error("The estimated hard stop has been reached or crossed. Review the exit under your plan.")
-                            elif current_price >= holding_target:
-                                st.success("The estimated final target has been reached. Review the planned exit.")
-                            elif sessions_held >= PAPER_TIME_STOP_SESSIONS:
-                                st.error("TIME STOP REACHED — the position has reached 12 sessions. The rule calls for an exit at the next market open; the dashboard does not place orders.")
-                            elif sessions_held == PAPER_TIME_STOP_SESSIONS - 1:
-                                st.error("CAPITAL TRAPPED — Day 11 of 12. If the position remains open through the next session close, the time stop calls for an exit at the following market open.")
-                            else:
-                                st.info("No stop, target, or time-stop level has been reached. Recheck the plan at each daily close.")
-                            st.caption("The time-stop count uses available daily candles from the entry date. Stop and target are estimates from pre-entry ATR and exclude costs, taxes, and gaps.")
-                        else:
-                            scale_price = average_entry + scale_multiple * entry_atr
-                            active_stop = average_entry if already_scaled else holding_stop
-                            st.metric("Current plan stop", money(active_stop))
-                            st.metric("Sell 50% level", "Already done" if already_scaled else money(scale_price))
-                            st.metric("Final target", money(holding_target))
-                            if current_price <= active_stop:
-                                st.error("The estimated stop level has been reached or crossed. Under this plan, exit the remaining holding.")
-                            elif current_price >= holding_target:
-                                st.success("The estimated final target has been reached. Under this plan, sell the remaining shares.")
-                            elif already_scaled:
-                                st.info(f"You marked the first half as sold. Keep the stop on the remaining shares at your entry price ({money(average_entry)}) and target {money(holding_target)}.")
-                            elif current_price >= scale_price:
-                                st.success(f"The estimated half-off level has been reached: the rule says sell 50%, then move the stop on the remaining shares to your entry price ({money(average_entry)}).")
-                            else:
-                                st.info(f"No management level has been reached yet. Hold to the plan; sell half at {money(scale_price)}, move the remaining stop to {money(average_entry)}, and target {money(holding_target)}.")
-                            st.caption("Estimated from the last available ATR and Nifty regime before your entry date; this does not include fees, taxes, dividends, gaps, or any partial sale you may already have made.")
-            elif owns_stock == "No":
-                if limited_portfolio_mode:
-                    st.write("You marked that you do not own this stock. The displayed plan is a single-entry, single-target reference; no order is placed.")
-                elif selected["Action"] == "BUY":
-                    st.info(f"This is a new-entry setup, not a half-off instruction. If you choose to enter, the current illustration says sell 50% near {money(selected['Price'] + selected['Scale-out ATR multiple'] * selected['ATR (14)'])} and move the remaining stop to entry.")
-                else:
-                    st.write("You marked that you do not own this stock. There is no holding to scale out of; use the BUY/SELL rating as a research signal only.")
             metric_columns = st.columns(3)
             metric_columns[0].metric("ADX (14)", f"{selected['ADX (14)']:.1f}")
             metric_columns[1].metric("CMF (20)", f"{selected['CMF (20)']:.2f}")
@@ -1673,7 +1484,7 @@ def main() -> None:
                     f"stock-above-SMA-200, RSI 40–70, and close-below-₹{LIMITED_MODE_PRICE_CEILING:,.0f} filters. "
                     f"The plan has one next-open entry reference, a fixed 2×ATR stop, and one +{LIMITED_MODE_TARGET_ATR:.0f}×ATR target in every regime, with no trailing stop or partial exit. "
                     f"It estimates whole shares from the per-stock budget of {money(per_stock_budget)} and the latest close; it does not allocate your total account balance or place orders. "
-                    f"In **Your position**, the {PAPER_TIME_STOP_SESSIONS}-session count includes the entry session; Day 11 shows a red CAPITAL TRAPPED warning, "
+                    f"In **Active Portfolio**, the {PAPER_TIME_STOP_SESSIONS}-session count includes the entry session; Day 11 shows a red CAPITAL TRAPPED warning, "
                     "and after the 12th session close the time-stop rule calls for an exit at the next market open. "
                     "All displayed entry and risk prices are provisional references from daily data; actual fills, fees, taxes, and gaps can differ."
                 )
@@ -1748,7 +1559,7 @@ def main() -> None:
                 f"**Strict rules:** Also requires Close > SMA20 > SMA50 > SMA200, MACD > signal, volume ≥1.2× its 20-day average, ADX ≥{ADX_MINIMUM:.0f}, positive CMF, Bollinger %B ≤1.10, and the selected Sharpe/drawdown/P/E filters to pass.\n\n"
                 f"**Market regime:** Nifty 50 above its 200-day SMA selects Bull mode (sell 50% at +2 × ATR, move the remaining stop to entry, and keep a +4 × ATR final target). At or below its 200-day SMA selects Defensive mode (sell 50% at +1.5 × ATR, move the remaining stop to entry, and keep a +3 × ATR final target). If index data is unavailable, BUY setups are paused.\n\n"
                 "**Paper trade management:** A BUY queues a virtual entry at the next daily open. At entry, the initial stop is fixed at entry − 2 × the signal day's ATR. The regime-specific 50% scale-out and final target are locked from the signal-day Nifty regime; after scale-out, the remaining stop moves to entry. If the trade is still open at the close of session 12, an exit is queued for the next session open. If stop and target are both touched in one daily candle, the stop is assumed first; gaps through a stop are filled at the open. A SELL signal also queues an exit for the next session open. This is a session-only paper log, not a brokerage position or an order.\n\n"
-                "**Your position:** Select whether you own the chosen stock. For an existing holding, enter your average price and entry date; the dashboard estimates the initial stop, 50% scale-out level, and target from ATR before the entry date and the Nifty regime then. It checks the latest close against those levels. It does not know about any partial sales you have already made and cannot access or place orders in your broker account.\n\n"
+                "**Active Portfolio:** Personal entry prices and dates are available only in the local copy on your computer; the public link disables this tab. The local ledger auto-saves to a project-folder JSON file that is ignored by Git. The app calculates the fixed 2×ATR stop and 3×ATR target from each entry and shows the 12-session action prompt. It never accesses your broker account or places orders.\n\n"
                 "In Strict rules mode, BUY requires both the common score/RSI entry gate and all strict indicator checks. **HOLD** means long-term trend and momentum are positive but one or more BUY checks fail. **SELL** is a review flag; in score mode it reflects a bearish indicator balance, while in strict mode it requires price < SMA50, MACD < signal, ADX ≥20, and CMF <0. Insufficient required data is reported as an error. The displayed 1Y Sharpe and drawdown are historical stock statistics, not a strategy backtest."
             )
             st.write("Indicators: SMA 20/50/200, Wilder RSI(14), MACD(12, 26, 9), ATR(14), Bollinger Bands(20, 2), ADX(14), CMF(20), 20-day average volume, trailing P/E, and one-year historical stock Sharpe/max drawdown.")

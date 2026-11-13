@@ -31,17 +31,6 @@ jobs:
       - name: Scan the Nifty 100
         run: python daily_scan.py --output daily_scan.json
 
-      - name: Refresh private user portfolios
-        env:
-          PORTFOLIO_GITHUB_TOKEN: ${{ secrets.PORTFOLIO_GITHUB_TOKEN }}
-          PORTFOLIO_GIST_ID: ${{ secrets.PORTFOLIO_GIST_ID }}
-        run: |
-          if [ -n "$PORTFOLIO_GITHUB_TOKEN" ] && [ -n "$PORTFOLIO_GIST_ID" ]; then
-            python portfolio_scan.py
-          else
-            echo "Private portfolio tracking is not configured; skipping this step."
-          fi
-
       - name: Publish the latest scan to the data branch
         env:
           GH_TOKEN: ${{ github.token }}
