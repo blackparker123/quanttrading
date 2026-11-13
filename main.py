@@ -402,7 +402,9 @@ def render_active_portfolio() -> None:
             "Entry Date": st.column_config.DateColumn("Entry Date", format="DD MMM YYYY"),
         },
     )
-    st.session_state["active_portfolio_ledger"] = edited_ledger.copy()
+    # Keep the editor's original data as its base. Streamlit stores edits as a
+    # widget diff; replacing the base with the already-edited result can apply
+    # the diff twice on the next rerun and make rows/cells disappear.
     positions_payload = _ledger_positions(edited_ledger)
     positions_signature = json.dumps(positions_payload, sort_keys=True)
     saved_signature = st.session_state.get("active_portfolio_signature")
