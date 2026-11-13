@@ -466,7 +466,8 @@ def render_active_portfolio() -> None:
 
     if rows:
         result = pd.DataFrame(rows)
-        table = result[["Ticker", "Entry Price", "Entry Date", "Current Close", "As of", "Hard Stop", "Final Target", "Regime at Entry", "Sessions", "Status", "Tomorrow's Action"]].copy()
+        result_columns = ["Ticker", "Entry Price", "Entry Date", "Current Close", "As of", "Hard Stop", "Final Target", "Regime at Entry", "Sessions", "Status", "Tomorrow's Action"]
+        table = result.reindex(columns=result_columns).copy()
         for column in ("Entry Price", "Current Close", "Hard Stop", "Final Target"):
             table[column] = table[column].map(money)
         status_colors = {
@@ -485,8 +486,28 @@ def render_active_portfolio() -> None:
             axis=1,
         )
         st.dataframe(styled, hide_index=True, width="stretch", height=min(620, 46 + 44 * len(table)))
+        stock_choices = {
+            f"{row['Ticker']} · {row['Status']}": index
+            for index, row in result.iterrows()
+        }
+        selected_choice = st.selectbox("Choose a stock to see what to do next", list(stock_choices), key="active_portfolio_next_move")
+        selected_row = result.loc[stock_choices[selected_choice]]
+        st.markdown(f"#### {selected_row['Ticker']} — {selected_row['Status']}")
+        command = selected_row["Tomorrow's Action"]
+        if selected_row["Status"] == "HOLD":
+            st.success(command)
+        elif selected_row["Status"] in ("TARGET HIT", "STOP HIT", "TIME STOP"):
+            st.error(command)
+        else:
+            st.warning(command)
+        if pd.notna(selected_row.get("Current Close")):
+            st.caption(
+                f"Entry {money(selected_row['Entry Price'])} · Current close {money(selected_row['Current Close'])} "
+                f"· Stop {money(selected_row['Hard Stop'])} · Target {money(selected_row['Final Target'])} "
+                f"· Session {selected_row['Sessions']}/{PAPER_TIME_STOP_SESSIONS} · Data through {selected_row['As of']}"
+            )
     else:
-        st.info("Add a filled position to the ledger to see its stop, target, session count, and next-open action.")
+        st.info("Add the ticker, your filled entry price, and entry date. The dashboard calculates its stop, target, and next action as soon as all three are entered.")
 
     st.caption(
         "Stops and targets use the entry price plus ATR from the last available candle before entry; regime is also fixed from that date. "
